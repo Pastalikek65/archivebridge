@@ -43,8 +43,11 @@ DEVELOPMENT_COMMIT = "development"
 LEGACY_VERSION = "0.1.0"
 LEGACY_COMMIT = "a139333f7e2b7e16cb6ace6b0555ab2f15de6f95"
 SCHEMA_VERSION = 1
+SOURCE_SCOPE = "beta-native-recovery-comparison-legacy-compatibility"
+PACKAGE_SCOPE = "beta-package-native-recovery-comparison-legacy-compatibility"
 EXPECTED_BETA_GO_VERSION = "go1.27.2"
 LARGE_MEMBER_BYTES = 128 * 1024 * 1024
+RECOVERY_FIXTURE_ENCODING = "deterministic repeated 16-KiB byte stream; source ZIP_STORED; not representative of JPEG compression"
 MEASUREMENT_KILL_WAIT_SECONDS = 10
 MEASUREMENT_STREAM_JOIN_SECONDS = 5
 MEASUREMENT_CLEANUP_BUDGET_SECONDS = 2 * MEASUREMENT_KILL_WAIT_SECONDS + 2 * MEASUREMENT_STREAM_JOIN_SECONDS
@@ -76,6 +79,11 @@ def _sha256_file(path: Path) -> Tuple[int, str]:
             size += len(block)
             digest.update(block)
     return size, digest.hexdigest()
+
+
+def _file_record(path: Path) -> Dict[str, Any]:
+    size, digest = _sha256_file(path)
+    return {"path": str(path), "bytes": size, "sha256": digest}
 
 
 def _real_file(path: Path) -> bool:
@@ -225,7 +233,7 @@ class Evidence:
             "schemaVersion": SCHEMA_VERSION,
             "product": "ArchiveBridge",
             "status": "running",
-            "qualification": {"qualified": False, "scope": "beta-native-recovery-comparison-legacy-compatibility"},
+            "qualification": {"qualified": False, "scope": SOURCE_SCOPE},
             "startedAtUtc": _now(),
             "finishedAtUtc": None,
             "environment": self._environment(),
@@ -641,7 +649,7 @@ def _synthetic_large_zip(path: Path) -> Dict[str, Any]:
         info.create_system = 3
         info.external_attr = 0o100644 << 16
         info.compress_type = zipfile.ZIP_STORED
-        block = random.Random(0xAB2026).randbytes(64 * 1024)
+        block = random.Random(0xAB2026).randbytes(16 * 1024)
         with archive.open(info, "w", force_zip64=True) as target:
             remaining = LARGE_MEMBER_BYTES
             while remaining:
@@ -649,7 +657,9 @@ def _synthetic_large_zip(path: Path) -> Dict[str, Any]:
                 target.write(part)
                 remaining -= len(part)
     size, digest = _sha256_file(path)
-    return {"path": str(path), "bytes": size, "sha256": digest, "mediaCount": small_count + 1, "sidecarCount": 1, "largeMemberBytes": LARGE_MEMBER_BYTES}
+    return {"path": str(path), "bytes": size, "sha256": digest, "mediaCount": small_count + 1,
+            "sidecarCount": 1, "largeMemberBytes": LARGE_MEMBER_BYTES,
+            "fixtureEncoding": RECOVERY_FIXTURE_ENCODING}
 
 
 def _stage_snapshot(output: Path) -> Dict[str, Any]:
@@ -664,6 +674,106 @@ def _stage_snapshot(output: Path) -> Dict[str, Any]:
         size, digest = _sha256_file(child)
         entries[child.name] = {"bytes": size, "sha256": digest}
     return entries
+
+
+def _copy_interrupted_stage_snapshot(out: Path, archive: Path, plan_id: str,
+                                     checkpoint: Mapping[str, Any]) -> Dict[str, Any]:
+    """Retain a bounded owned-stage snapshot before a successful resume removes it."""
+    before = _stage_snapshot(archive)
+    owner_name = ".archivebridge-stage-owner.json"
+    if (checkpoint.get("planId") != plan_id or owner_name not in before
+            or before != checkpoint.get("pausedStageSnapshot")):
+        raise AcceptanceFailure("post-death stage differs from the observed plan-owned checkpoint")
+    if set(before) - {owner_name} and any(
+        not name.startswith(("member-", "manifest-")) for name in set(before) - {owner_name}
+    ):
+        raise AcceptanceFailure("post-death stage contains an unrecognized file")
+    if not set(before) - {owner_name}:
+        raise AcceptanceFailure("post-death stage has no partial member files to snapshot")
+    max_snapshot_bytes = LARGE_MEMBER_BYTES + (4 * 1024 * 1024)
+    if sum(item["bytes"] for item in before.values()) > max_snapshot_bytes:
+        raise AcceptanceFailure("post-death stage exceeds its bounded snapshot size")
+
+    stage = archive / ".archivebridge-staging"
+    if before[owner_name]["bytes"] > 1024 * 1024:
+        raise AcceptanceFailure("post-death stage owner marker exceeds its size bound")
+    owner_bytes = (stage / owner_name).read_bytes()
+    owner, _ = _load_json(stage / owner_name, "post-death stage owner marker")
+    if (not isinstance(owner, dict) or owner.get("schemaVersion") != 1
+            or owner.get("planId") != plan_id or _sha256(owner_bytes) != checkpoint.get("ownerMarkerSha256")):
+        raise AcceptanceFailure("post-death stage owner marker is not bound to the interrupted plan")
+
+    snapshot_root = out / "interrupted-stage-snapshot"
+    try:
+        snapshot_root.mkdir(mode=0o700)
+    except FileExistsError as exc:
+        raise AcceptanceFailure("refusing to reuse an existing interrupted-stage snapshot directory") from exc
+    copied: Dict[str, Dict[str, Any]] = {}
+    total = 0
+    for name, identity in sorted(before.items()):
+        source = stage / name
+        source_info = source.lstat()
+        if (not stat.S_ISREG(source_info.st_mode) or stat.S_ISLNK(source_info.st_mode)
+                or _is_reparse(source_info) or getattr(source_info, "st_nlink", 1) != 1
+                or source_info.st_size != identity["bytes"]):
+            raise AcceptanceFailure("post-death stage snapshot source is linked, non-regular, or changed")
+        destination = snapshot_root / name
+        digest = hashlib.sha256()
+        count = 0
+        try:
+            with source.open("rb") as reader, destination.open("xb") as writer:
+                opened = os.fstat(reader.fileno())
+                if opened.st_size != source_info.st_size or getattr(opened, "st_ino", None) != getattr(source_info, "st_ino", None):
+                    raise AcceptanceFailure("post-death stage member changed before copying")
+                while True:
+                    block = reader.read(1024 * 1024)
+                    if not block:
+                        break
+                    count += len(block)
+                    total += len(block)
+                    if count > identity["bytes"] or total > max_snapshot_bytes:
+                        raise AcceptanceFailure("post-death stage snapshot exceeded its bounded copy size")
+                    digest.update(block)
+                    writer.write(block)
+                writer.flush()
+                os.fsync(writer.fileno())
+                final = os.fstat(reader.fileno())
+            after = source.lstat()
+        except OSError as exc:
+            raise AcceptanceFailure(f"cannot copy a post-death stage member safely: {exc}") from exc
+        copied_identity = {"bytes": count, "sha256": digest.hexdigest()}
+        if (count != identity["bytes"] or copied_identity != identity
+                or final.st_size != source_info.st_size
+                or getattr(final, "st_ino", None) != getattr(source_info, "st_ino", None)
+                or getattr(after, "st_ino", None) != getattr(source_info, "st_ino", None)):
+            raise AcceptanceFailure("copied post-death stage member does not match its live source")
+        copied[name] = copied_identity
+    if _stage_snapshot(archive) != before:
+        raise AcceptanceFailure("live stage changed during snapshot copy")
+    snapshot_files: set[str] = set()
+    for entry in snapshot_root.iterdir():
+        info = entry.lstat()
+        if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or _is_reparse(info)
+                or getattr(info, "st_nlink", 1) != 1):
+            raise AcceptanceFailure("retained stage snapshot contains a linked or non-regular member")
+        snapshot_files.add(entry.name)
+    if snapshot_files != set(copied) or len(snapshot_files) != len(copied):
+        raise AcceptanceFailure("retained stage snapshot has an unexpected member inventory")
+    for name, identity in copied.items():
+        if _sha256_file(snapshot_root / name) != (identity["bytes"], identity["sha256"]):
+            raise AcceptanceFailure("retained stage snapshot bytes differ from the copied source")
+
+    members_json = json.dumps(copied, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return {
+        "relativeDirectory": "interrupted-stage-snapshot",
+        "planId": plan_id,
+        "ownerMarkerSha256": copied[owner_name]["sha256"],
+        "capturedAfterDeath": True,
+        "capturedBeforeResume": True,
+        "capturedAtUtc": _now(),
+        "members": copied,
+        "treeSha256": _sha256(members_json),
+    }
 
 
 def _start_cli(argv: Sequence[str], stdout_path: Path, stderr_path: Path) -> subprocess.Popen[bytes]:
@@ -1092,7 +1202,7 @@ def _write_source_commit_identity(evidence: Evidence, expected_version: str, exp
     if payload.get("version") != expected_version or payload.get("commit") != expected_commit:
         raise AcceptanceFailure("native beta binary reports a different version or source commit")
     evidence.check("native-version-identity", True, "native beta binary reports its expected version and source identity", {"version": expected_version, "commit": expected_commit})
-    evidence.report["qualification"] = {"qualified": False, "scope": "beta-native-recovery-comparison-legacy-compatibility",
+    evidence.report["qualification"] = {"qualified": False, "scope": SOURCE_SCOPE,
                                          "expectedVersion": expected_version, "expectedCommit": expected_commit,
                                          "goVersion": binary_go_version, "hostGoVersion": host_go_version, "developmentBuild": development,
                                          "note": "beta remains unqualified pending complete cross-platform review"}
@@ -1150,7 +1260,13 @@ def _run_acceptance(args: argparse.Namespace) -> Tuple[Path, Evidence]:
     evidence.report["outputs"]["directory"] = str(out.resolve(strict=True))
     evidence.report["qualification"]["expectedVersion"] = args.expected_version
     evidence.report["qualification"]["expectedCommit"] = args.expected_commit
-    _write_source_commit_identity(evidence, args.expected_version, args.expected_commit, fixtures, binary, args.allow_development)
+    _write_source_commit_identity(evidence, args.expected_version, args.expected_commit,
+                                  fixtures, binary, args.allow_development)
+    evidence.report["qualification"].update({
+        "actualVersion": args.expected_version,
+        "actualCommit": args.expected_commit.lower(),
+        "scope": PACKAGE_SCOPE if beta_package_before is not None else SOURCE_SCOPE,
+    })
     if beta_package_before is not None:
         evidence.report["inputs"].update({
             "betaPackageBefore": beta_package_before["package"],
@@ -1170,8 +1286,8 @@ def _run_acceptance(args: argparse.Namespace) -> Tuple[Path, Evidence]:
         for source in expected["sources"]
     ]
     if legacy_package is not None and legacy_checksum is not None and legacy_fixtures is not None:
-        evidence.report["inputs"]["legacyPackageBefore"] = {"bytes": _sha256_file(legacy_package)[0], "sha256": _sha256_file(legacy_package)[1]}
-        evidence.report["inputs"]["legacyChecksumBefore"] = {"bytes": _sha256_file(legacy_checksum)[0], "sha256": _sha256_file(legacy_checksum)[1]}
+        evidence.report["inputs"]["legacyPackageBefore"] = _file_record(legacy_package)
+        evidence.report["inputs"]["legacyChecksumBefore"] = _file_record(legacy_checksum)
         evidence.report["inputs"]["legacyFixturesTreeBefore"] = _tree_fingerprint(legacy_fixtures)
 
     sample_plan_path = out / "sample-plan.json"
@@ -1195,7 +1311,7 @@ def _run_acceptance(args: argparse.Namespace) -> Tuple[Path, Evidence]:
     _fixture_plan_checks(plan, expected["expected"])
     if inspect_plan != plan or plan_payload.get("plan") != plan:
         raise AcceptanceFailure("inspect result, plan response, and saved plan differ")
-    evidence.report["outputs"]["samplePlan"] = {"path": str(sample_plan_path), "bytes": len(plan_bytes), "sha256": _sha256(plan_bytes), "fullPlan": plan}
+    evidence.report["outputs"]["samplePlan"] = {"path": str(sample_plan_path), "bytes": len(plan_bytes), "sha256": _sha256(plan_bytes), "planId": plan["id"], "fullPlan": plan}
     evidence.check("plan-roundtrip", True, "saved plan equals independent inspect and plan response")
     original = _check_original_occurrences(plan, expected["sources"])
     evidence.report["outputs"]["sampleOriginalOccurrences"] = original
@@ -1207,7 +1323,7 @@ def _run_acceptance(args: argparse.Namespace) -> Tuple[Path, Evidence]:
     manifest, manifest_bytes = _load_json(sample_output / "manifest.json", "sample export manifest")
     _assert_plan_manifest_equal(plan, manifest)
     exported = _check_export_bytes(plan, sample_output)
-    evidence.report["outputs"]["sampleManifest"] = {"path": str(sample_output / "manifest.json"), "bytes": len(manifest_bytes), "sha256": _sha256(manifest_bytes), "fullManifest": manifest}
+    evidence.report["outputs"]["sampleManifest"] = {"path": str(sample_output / "manifest.json"), "bytes": len(manifest_bytes), "sha256": _sha256(manifest_bytes), "planId": plan["id"], "fullManifest": manifest}
     evidence.report["outputs"]["sampleExportedOccurrences"] = exported
     evidence.check("sample-original-byte-preservation", True, "all six media and seven sidecar occurrences match their original ZIP member bytes")
     resume_entry = evidence.run("resume", [str(binary), "resume", "--plan", str(sample_plan_path), "--out", str(sample_output), "--json"])
@@ -1259,10 +1375,18 @@ def _run_acceptance(args: argparse.Namespace) -> Tuple[Path, Evidence]:
     if after_fixtures != evidence.report["inputs"]["fixturesTreeBefore"]:
         raise AcceptanceFailure("pinned source fixtures changed during beta acceptance")
     if legacy_package is not None and legacy_checksum is not None and legacy_fixtures is not None:
-        if {"bytes": _sha256_file(legacy_package)[0], "sha256": _sha256_file(legacy_package)[1]} != evidence.report["inputs"]["legacyPackageBefore"]:
+        legacy_package_after = _file_record(legacy_package)
+        legacy_checksum_after = _file_record(legacy_checksum)
+        if {key: value for key, value in legacy_package_after.items() if key != "path"} != {
+            key: value for key, value in evidence.report["inputs"]["legacyPackageBefore"].items() if key != "path"
+        }:
             raise AcceptanceFailure("published MVP package bytes changed during acceptance")
-        if {"bytes": _sha256_file(legacy_checksum)[0], "sha256": _sha256_file(legacy_checksum)[1]} != evidence.report["inputs"]["legacyChecksumBefore"]:
+        if {key: value for key, value in legacy_checksum_after.items() if key != "path"} != {
+            key: value for key, value in evidence.report["inputs"]["legacyChecksumBefore"].items() if key != "path"
+        }:
             raise AcceptanceFailure("published MVP checksum file changed during acceptance")
+        evidence.report["inputs"].update({"legacyPackageAfter": legacy_package_after,
+                                          "legacyChecksumAfter": legacy_checksum_after})
         if _tree_fingerprint(legacy_fixtures) != evidence.report["inputs"]["legacyFixturesTreeBefore"]:
             raise AcceptanceFailure("legacy source fixtures changed during acceptance")
         assert legacy_root is not None
@@ -1450,6 +1574,7 @@ def _forced_death_flow(evidence: Evidence, binary: Path, out: Path) -> Tuple[Dic
             raise AcceptanceFailure("forced termination did not produce a nonzero owned-child exit")
         _assert_stage_preserved(archive, checkpoint)
         retained = _stage_snapshot(archive)
+        stage_snapshot = _copy_interrupted_stage_snapshot(out, archive, plan["id"], checkpoint)
         for rel, identity in completed.items():
             path = archive.joinpath(*rel.split("/"))
             if not _real_file(path) or _sha256_file(path) != (identity["bytes"], identity["sha256"]):
@@ -1458,7 +1583,8 @@ def _forced_death_flow(evidence: Evidence, binary: Path, out: Path) -> Tuple[Dic
         if source_identity != (fixture["bytes"], fixture["sha256"]):
             raise AcceptanceFailure("synthetic ZIP source changed during interrupted export")
         info = {**fixture, "planPath": str(plan_path), "planId": plan["id"], "archivePath": str(archive), "sourceBeforeAfter": {"bytes": source_identity[0], "sha256": source_identity[1]},
-                "completedCAS": completed, "retainedStageAfterDeath": retained, "checkpoint": checkpoint, "plan": plan}
+                "completedCAS": completed, "retainedStageAfterDeath": retained, "stageSnapshot": stage_snapshot,
+                "checkpoint": checkpoint, "plan": plan}
         evidence.check("actual-forced-process-death-retains-owned-state", True, "the harness observed a nonzero stage file while its native child was alive, terminated that exact child, and verified the partial owner-bound stage remained", {
             "pid": process.pid, "exitCode": killed_exit, "stageMemberCount": len(retained), "completedCASFiles": len(completed)})
         return info, plan, archive

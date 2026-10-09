@@ -519,6 +519,7 @@ jobs:
         with:
           name: archivebridge-ci-${{ matrix.platform }}-${{ github.sha }}-attempt-${{ github.run_attempt }}
           retention-days: 30
+          include-hidden-files: true
           if-no-files-found: error
           path: |
             artifacts/**

@@ -7,6 +7,7 @@ import importlib.util
 import base64
 import contextlib
 import ctypes
+import hashlib
 import io
 import json
 import os
@@ -28,6 +29,16 @@ SPEC.loader.exec_module(beta)
 
 
 class BetaAcceptanceSafetyTests(unittest.TestCase):
+    def test_file_record_binds_exact_path_size_and_sha256(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "published-package.zip"
+            path.write_bytes(b"pinned package bytes")
+            self.assertEqual(beta._file_record(path), {
+                "path": str(path),
+                "bytes": len(b"pinned package bytes"),
+                "sha256": hashlib.sha256(b"pinned package bytes").hexdigest(),
+            })
+
     def test_checkpoint_requires_live_owned_process_and_nonempty_staged_member(self):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "archive"
@@ -89,6 +100,58 @@ class BetaAcceptanceSafetyTests(unittest.TestCase):
             member.write_bytes(b"different payload")
             with self.assertRaises(beta.AcceptanceFailure):
                 beta._assert_stage_preserved(output, checkpoint)
+
+    def test_forced_death_stage_snapshot_is_copied_before_resume_and_plan_bound(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "acceptance"
+            archive = output / "interrupted-archive"
+            stage = archive / ".archivebridge-staging"
+            stage.mkdir(parents=True)
+            plan_id = "e" * 64
+            owner_bytes = (json.dumps({"schemaVersion": 1, "planId": plan_id}, separators=(",", ":")) + "\n").encode()
+            (stage / ".archivebridge-stage-owner.json").write_bytes(owner_bytes)
+            (stage / "member-active").write_bytes(b"partially staged content")
+            paused = beta._stage_snapshot(archive)
+            checkpoint = {"planId": plan_id, "ownerMarkerSha256": beta._sha256(owner_bytes),
+                          "pausedStageSnapshot": paused}
+
+            snapshot = beta._copy_interrupted_stage_snapshot(output, archive, plan_id, checkpoint)
+
+            snapshot_root = output / snapshot["relativeDirectory"]
+            self.assertEqual(snapshot["planId"], plan_id)
+            self.assertTrue(snapshot["capturedAfterDeath"])
+            self.assertTrue(snapshot["capturedBeforeResume"])
+            self.assertRegex(snapshot["capturedAtUtc"], r"Z$")
+            self.assertEqual(snapshot["members"], paused)
+            self.assertEqual(snapshot["ownerMarkerSha256"], paused[".archivebridge-stage-owner.json"]["sha256"])
+            canonical = json.dumps(snapshot["members"], sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+            self.assertEqual(snapshot["treeSha256"], beta._sha256(canonical))
+            self.assertEqual(beta._stage_snapshot(archive), paused)
+            self.assertEqual({item.name for item in snapshot_root.iterdir()}, set(paused))
+
+    def test_forced_death_stage_snapshot_refuses_preexisting_destination_and_unknown_stage_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "acceptance"
+            archive = output / "archive"
+            stage = archive / ".archivebridge-staging"
+            stage.mkdir(parents=True)
+            plan_id = "f" * 64
+            owner_bytes = (json.dumps({"schemaVersion": 1, "planId": plan_id}) + "\n").encode()
+            (stage / ".archivebridge-stage-owner.json").write_bytes(owner_bytes)
+            (stage / "member-active").write_bytes(b"partial")
+            checkpoint = {"planId": plan_id, "ownerMarkerSha256": beta._sha256(owner_bytes),
+                          "pausedStageSnapshot": beta._stage_snapshot(archive)}
+            (output / "interrupted-stage-snapshot").mkdir()
+            with self.assertRaises(beta.AcceptanceFailure):
+                beta._copy_interrupted_stage_snapshot(output, archive, plan_id, checkpoint)
+
+            (output / "interrupted-stage-snapshot").rmdir()
+            (stage / "unexpected").write_bytes(b"unknown")
+            checkpoint["pausedStageSnapshot"] = beta._stage_snapshot(archive)
+            with self.assertRaises(beta.AcceptanceFailure):
+                beta._copy_interrupted_stage_snapshot(output, archive, plan_id, checkpoint)
 
     def test_fast_completed_cas_gate_checks_regular_member_sizes_before_pause(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -384,6 +447,7 @@ class BetaAcceptanceSafetyTests(unittest.TestCase):
         self.assertIn("--beta-package-root \"$package_root\"", workflow)
         self.assertIn("--out (Join-Path $repo 'artifacts\\package beta acceptance')", workflow)
         self.assertIn("--out \"$GITHUB_WORKSPACE/artifacts/package beta acceptance\"", workflow)
+        self.assertIn("include-hidden-files: true", workflow)
 
 
 if __name__ == "__main__":
