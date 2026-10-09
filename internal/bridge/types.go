@@ -10,6 +10,10 @@ import (
 
 const SchemaVersion = 1
 
+// ErrOutputLocked reports that another exporter currently holds the output lock.
+// Other lock acquisition failures are returned as distinct errors.
+var ErrOutputLocked = errors.New("output is locked by another exporter")
+
 // Limits bounds the amount of untrusted archive data accepted by Inspect.
 // Zero-valued fields are replaced with DefaultLimits values.
 type Limits struct {
@@ -168,6 +172,29 @@ type VerifyReport struct {
 	SidecarsChecked int     `json:"sidecarsChecked"`
 	BytesChecked    int64   `json:"bytesChecked"`
 	Issues          []Issue `json:"issues"`
+}
+
+// CompareReport describes a read-only check of the selected source archives
+// against both an inspection plan and an exported archive. A matched result
+// only covers these selected sources and the exported bytes represented by
+// their manifest; it does not claim anything about an entire account.
+type CompareReport struct {
+	Status          string            `json:"status"`
+	PlanID          string            `json:"planId"`
+	ArchivePlanID   string            `json:"archivePlanId,omitempty"`
+	SourcesChecked  int               `json:"sourcesChecked"`
+	MediaChecked    int               `json:"mediaChecked"`
+	SidecarsChecked int               `json:"sidecarsChecked"`
+	AlbumsChecked   int               `json:"albumsChecked"`
+	Mismatches      []CompareMismatch `json:"mismatches"`
+}
+
+// CompareMismatch is a sanitized, path-safe explanation of one failed check.
+// EntryPath is archive-internal and never contains the source's host path.
+type CompareMismatch struct {
+	Code      string `json:"code"`
+	EntryPath string `json:"entryPath,omitempty"`
+	Details   string `json:"details"`
 }
 
 func (p *Plan) validateVersion() error {

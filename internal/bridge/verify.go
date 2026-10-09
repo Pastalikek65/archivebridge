@@ -38,6 +38,14 @@ func Verify(ctx context.Context, archiveDir string) (*VerifyReport, error) {
 		report.Status = "failed"
 		report.Issues = append(report.Issues, Issue{Code: "unexpected_output", Details: "Output contains an entry outside the manifest-owned archive."})
 	}
+	if err := validateExistingOutputLock(out); err != nil {
+		report.Status = "failed"
+		report.Issues = append(report.Issues, Issue{Code: "invalid_lock", Details: "The output lock is not a zero-byte, single-link regular file."})
+	}
+	if err := validateStageForVerify(out, m.PlanID); err != nil {
+		report.Status = "failed"
+		report.Issues = append(report.Issues, Issue{Code: "invalid_staging", Details: "Output staging state is incomplete or does not match the archive."})
+	}
 	for _, f := range m.Files {
 		if err := ctx.Err(); err != nil {
 			return nil, err

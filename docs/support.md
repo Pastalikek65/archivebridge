@@ -1,6 +1,6 @@
 # Supported inputs and limits
 
-Initial targets are Windows 11 x64 and Ubuntu 24.04 x64, with filesystems supporting hard links (such as NTFS and ext4). Qualification is reported per release; source builds do not inherit a release's platform evidence. Packages are unsigned. A current Chromium browser is the viewer qualification target.
+MVP 0.1.0 packages target Windows x64 and Linux x64. Beta 0.2.0 native acceptance targets a pinned GitHub-hosted Windows Server 2025 runner and Ubuntu 24.04 runner; beta platform qualification is pending completion and review of that workflow. A beta source build does not inherit release evidence. Packages are unsigned. A current Chromium browser is the viewer qualification target.
 
 Source parts can be ZIP, `.tar.gz` or `.tgz`. Supported media extensions include common JPEG/PNG/GIF/WebP/HEIC/TIFF/AVIF images, camera raw files and MP4/MOV/MKV/WebM/AVI and other documented video extensions. Preservation is byte copying, not decoding or format conversion. The viewer previews JPEG/PNG only; other supported media can be downloaded. Preview headers must fit within 1 MiB, dimensions within 32,768 pixels per side and 64 million pixels overall. A rejected preview does not change its stored original.
 

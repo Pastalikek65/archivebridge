@@ -30,7 +30,8 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 ROOT = Path(__file__).resolve().parents[1]
 PRODUCT = "ArchiveBridge"
 SUPPORTED_VERSIONS = ("0.1.0", "0.2.0", "1.0.0")
-GO_VERSION = "go1.27.0"
+GO_VERSION = "go1.27.2"
+RELEASE_GO_VERSIONS = {"0.1.0": "go1.27.0", "0.2.0": GO_VERSION, "1.0.0": GO_VERSION}
 ARCH = "x64"
 GO_ARCH = "amd64"
 SCHEMA_VERSION = 1
@@ -366,10 +367,10 @@ def _scrub_build_info(output: str, binary: Path, toolchain: str) -> bytes:
     return ("\n".join(sanitized) + "\n").encode("utf-8")
 
 
-def _verify_build_info(binary: Path, platform: str, source_commit: str, root: Path) -> Tuple[str, bytes]:
+def _verify_build_info(binary: Path, platform: str, source_commit: str, root: Path, version: str) -> Tuple[str, bytes]:
     go_executable = shutil.which("go")
     if go_executable is None:
-        _fail("TOOL_UNAVAILABLE", "Go 1.27.0 is required to inspect binary build information")
+        _fail("TOOL_UNAVAILABLE", "Go is required to inspect binary build information")
     result = _run_fixed((go_executable, "version", "-m", str(binary)), cwd=root)
     if result.returncode != 0:
         _fail("BUILD_INFO", "go version -m could not inspect the supplied binary")
@@ -380,8 +381,9 @@ def _verify_build_info(binary: Path, platform: str, source_commit: str, root: Pa
     except UnicodeError:
         _fail("BUILD_INFO", "go version -m output is not UTF-8")
     toolchain, built_path, settings = _parse_go_version_m(output, binary)
-    if toolchain != GO_VERSION:
-        _fail("BUILD_INFO", f"binary toolchain must be {GO_VERSION}")
+    expected_toolchain = RELEASE_GO_VERSIONS[version]
+    if toolchain != expected_toolchain:
+        _fail("BUILD_INFO", f"binary toolchain must be {expected_toolchain} for release {version}")
     expected_module = _module_path(root) + "/cmd/archivebridge"
     if built_path != expected_module:
         _fail("BUILD_INFO", "binary was not built from the ArchiveBridge command package")
@@ -573,7 +575,7 @@ def package_release(root: Path, binary_arg: str, version: str, source_commit: st
     binary = _verify_binary_path(root, binary_arg, platform)
     _verify_binary_header(binary, platform)
     _verify_version_json(binary, version, source_commit, root)
-    toolchain, build_info = _verify_build_info(binary, platform, source_commit, root)
+    toolchain, build_info = _verify_build_info(binary, platform, source_commit, root, version)
     members = _collect_members(root, binary, platform, build_info)
     manifest = _manifest_bytes(version, source_commit, platform, toolchain, members)
     top = _top_directory(version, platform)

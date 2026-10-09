@@ -24,4 +24,6 @@ Kontrollü olarak kesilmiş aktarımı aynı planla sürdür:
 ./archivebridge resume --plan plan.json --out fotograf-arsivi
 ```
 
-Mevcut dosyalar hash ile kontrol edilir; bozuk veya farklı dosyanın üzerine yazılmaz. İlk MVP zorla süreç sonlandırma sonrası toparlanmayı henüz desteklediğini iddia etmez. Kaynak arşivlerini, planı ve metadata'yı özel tut. Doğrulama seçilen arşiv parçaları ve manifest içindir; tüm hesabın eksiksiz yedeği veya manifestin imzalı doğruluğu anlamına gelmez.
+Yayımlanmış 0.1.0 paketi, zarif iptalden sonra `resume` ile devam etmeyi destekler; mevcut dosyalar hash ile kontrol edilir ve bozuk ya da farklı dosyanın üzerine yazılmaz. `compare` ile ani süreç sonlandırması sonrası kurtarma, henüz yayımlanmamış 0.2 beta kaynak koduna aittir. Beta'yı denemek için Go 1.27.2 ile bu depoyu derle: Linux'ta `go build -trimpath -o archivebridge ./cmd/archivebridge`, Windows PowerShell'de `go build -trimpath -o archivebridge.exe ./cmd/archivebridge` kullan. Beta çapraz platform CI ve inceleme tamamlanana kadar nitelikli değildir. Kaynak arşivlerini, planı ve metadata'yı özel tut. Doğrulama seçilen arşiv parçaları ve manifest içindir; tüm hesabın eksiksiz yedeği veya manifestin imzalı doğruluğu anlamına gelmez.
+
+`compare`, beta 0.2.0 derlemesinde planın işaret ettiği özgün arşivleri yeniden inceler ve planı manifest ile saklanan baytlarla karşılaştırır. Kaynak arşivleri özgün yollarında erişilebilir olmalıdır. Yayımlanmış 0.1.0 paketinde `compare` komutu bulunmaz.

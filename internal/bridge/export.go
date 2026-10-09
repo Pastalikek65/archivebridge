@@ -11,12 +11,15 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
 const ownerFilename = ".archivebridge-owner.json"
 const manifestFilename = "manifest.json"
 const stagingName = ".archivebridge-staging"
+const stageOwnerFilename = ".archivebridge-stage-owner.json"
+const lockFilename = ".archivebridge.lock"
 
 type ownerRecord struct {
 	SchemaVersion int    `json:"schemaVersion"`
@@ -53,9 +56,43 @@ func Export(ctx context.Context, p *Plan, outputDir string) (*ExportReport, erro
 			return nil, fmt.Errorf("source %d no longer matches the inspected identity", i)
 		}
 	}
+	if err := os.MkdirAll(filepath.Dir(out), 0700); err != nil {
+		return nil, err
+	}
+	if err := os.Mkdir(out, 0700); err != nil && !errors.Is(err, os.ErrExist) {
+		return nil, err
+	}
+	rootInfo, err := os.Lstat(out)
+	if err != nil {
+		return nil, err
+	}
+	if rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() {
+		return nil, errors.New("output root must be a real directory, not a symlink")
+	}
+	if err := preflightOwnedOutput(out, p.ID); err != nil {
+		return nil, err
+	}
+	lock, err := acquireOutputLock(out)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = lock.Close() }()
 	if err := prepareOwnedOutput(out, p.ID); err != nil {
 		return nil, err
 	}
+	stage := filepath.Join(out, stagingName)
+	if err := recoverOwnedStage(stage, p.ID); err != nil {
+		return nil, err
+	}
+	stageCompleted := false
+	defer func() {
+		// A graceful context cancellation can clean its own now-inactive stage;
+		// process death cannot run this cleanup and is recovered on the next
+		// locked Export call.
+		if !stageCompleted && ctx.Err() != nil {
+			_ = finishOwnedStage(stage, p.ID)
+		}
+	}()
 	expected, err := expectedTree(p)
 	if err != nil {
 		return nil, err
@@ -63,12 +100,6 @@ func Export(ctx context.Context, p *Plan, outputDir string) (*ExportReport, erro
 	if err := validateOwnedTree(out, expected); err != nil {
 		return nil, err
 	}
-
-	stage := filepath.Join(out, stagingName)
-	if err := os.Mkdir(stage, 0700); err != nil {
-		return nil, fmt.Errorf("cannot create exclusive staging directory: %w", err)
-	}
-	defer func() { _ = os.Remove(stage) }()
 
 	report := &ExportReport{PlanID: p.ID, OutputPath: out, Status: "complete", Issues: append([]Issue{}, p.Issues...)}
 	var expandedBytes int64
@@ -85,11 +116,17 @@ func Export(ctx context.Context, p *Plan, outputDir string) (*ExportReport, erro
 		targets := make(map[string]contentTarget)
 		for _, f := range p.Files {
 			if f.SourceIndex == si {
+				if _, exists := targets[f.EntryPath]; exists {
+					return nil, errors.New("multiple planned outputs refer to one archive source entry")
+				}
 				targets[f.EntryPath] = contentTarget{hash: f.SHA256, bytes: f.Bytes, out: f.OutputPath, entry: f.EntryPath}
 			}
 		}
 		for _, s := range p.Sidecars {
 			if s.SourceIndex == si {
+				if _, exists := targets[s.EntryPath]; exists {
+					return nil, errors.New("multiple planned outputs refer to one archive source entry")
+				}
 				targets[s.EntryPath] = contentTarget{hash: s.SHA256, bytes: s.Bytes, out: s.OutputPath, entry: s.EntryPath}
 			}
 		}
@@ -157,6 +194,10 @@ func Export(ctx context.Context, p *Plan, outputDir string) (*ExportReport, erro
 			return nil, err
 		}
 	}
+	if err := finishOwnedStage(stage, p.ID); err != nil {
+		return nil, fmt.Errorf("exported archive but could not clean owned staging area: %w", err)
+	}
+	stageCompleted = true
 	return report, nil
 }
 
@@ -206,8 +247,12 @@ func prepareOwnedOutput(out, planID string) error {
 	if err != nil {
 		return err
 	}
-	if len(entries) != 0 {
+	if len(entries) != 1 || entries[0].Name() != lockFilename {
 		return errors.New("refusing nonempty unowned output directory")
+	}
+	lockInfo, err := os.Lstat(filepath.Join(out, lockFilename))
+	if err != nil || lockInfo.Mode()&os.ModeSymlink != 0 || !lockInfo.Mode().IsRegular() || lockInfo.Size() != 0 {
+		return errors.New("unowned output contains an invalid lock file")
 	}
 	b, _ := json.Marshal(ownerRecord{SchemaVersion: SchemaVersion, PlanID: planID})
 	f, err := os.OpenFile(marker, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
@@ -230,8 +275,222 @@ func prepareOwnedOutput(out, planID string) error {
 	return nil
 }
 
+// preflightOwnedOutput rejects unrelated or invalid output directories before
+// creating the persistent lock file. All mutable validation is repeated under
+// the lock by prepareOwnedOutput and validateOwnedTree.
+func preflightOwnedOutput(out, planID string) error {
+	marker := filepath.Join(out, ownerFilename)
+	st, err := os.Lstat(marker)
+	if errors.Is(err, os.ErrNotExist) {
+		entries, err := os.ReadDir(out)
+		if err != nil {
+			return err
+		}
+		if len(entries) == 0 {
+			return nil
+		}
+		if len(entries) != 1 || entries[0].Name() != lockFilename {
+			return errors.New("refusing nonempty unowned output directory")
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if st.Mode()&os.ModeSymlink != 0 || !st.Mode().IsRegular() {
+		return errors.New("output ownership marker is not a regular file")
+	}
+	b, err := readJSONFile(marker, 4096)
+	if err != nil {
+		return err
+	}
+	var owner ownerRecord
+	if err := decodeStrict(b, &owner); err != nil || owner.SchemaVersion != SchemaVersion || owner.PlanID != planID {
+		return errors.New("output ownership marker is invalid or belongs to another plan")
+	}
+	return nil
+}
+
+func recoverOwnedStage(stage, planID string) error {
+	if err := os.Mkdir(stage, 0700); err != nil && !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("cannot create exclusive staging directory: %w", err)
+	}
+	info, err := os.Lstat(stage)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("staging path must be a real directory")
+	}
+	marker := filepath.Join(stage, stageOwnerFilename)
+	markerInfo, markerErr := os.Lstat(marker)
+	if errors.Is(markerErr, os.ErrNotExist) {
+		entries, err := os.ReadDir(stage)
+		if err != nil {
+			return err
+		}
+		if len(entries) != 0 {
+			return errors.New("staging directory has contents but no valid ownership marker")
+		}
+		if err := writeStageOwner(marker, planID); err != nil {
+			return err
+		}
+	} else if markerErr != nil {
+		return markerErr
+	} else {
+		if markerInfo.Mode()&os.ModeSymlink != 0 || !markerInfo.Mode().IsRegular() {
+			return errors.New("staging ownership marker is not a regular file")
+		}
+		b, err := readJSONFile(marker, 4096)
+		if err != nil {
+			return err
+		}
+		var owner ownerRecord
+		if err := decodeStrict(b, &owner); err != nil || owner.SchemaVersion != SchemaVersion || owner.PlanID != planID {
+			return errors.New("staging ownership marker does not match this plan")
+		}
+	}
+
+	entries, err := os.ReadDir(stage)
+	if err != nil {
+		return err
+	}
+	stale := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		if name == stageOwnerFilename {
+			continue
+		}
+		if !knownStageTempName(name) {
+			return fmt.Errorf("staging directory contains an unrecognized entry %q", name)
+		}
+		full := filepath.Join(stage, name)
+		st, err := os.Lstat(full)
+		if err != nil {
+			return err
+		}
+		if st.Mode()&os.ModeSymlink != 0 || !st.Mode().IsRegular() {
+			return fmt.Errorf("staging entry %q is not a regular file", name)
+		}
+		stale = append(stale, full)
+	}
+	// Validate the complete directory before removing any member so an
+	// unexpected sibling never causes partial cleanup of preserved state.
+	for _, full := range stale {
+		if err := os.Remove(full); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func knownStageTempName(name string) bool {
+	var prefix string
+	switch {
+	case strings.HasPrefix(name, "member-"):
+		prefix = "member-"
+	case strings.HasPrefix(name, "manifest-"):
+		prefix = "manifest-"
+	default:
+		return false
+	}
+	suffix := strings.TrimPrefix(name, prefix)
+	if len(suffix) == 0 || len(suffix) > 10 {
+		return false
+	}
+	for _, c := range suffix {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	n, err := strconv.ParseUint(suffix, 10, 32)
+	return err == nil && strconv.FormatUint(n, 10) == suffix
+}
+
+func writeStageOwner(filename, planID string) error {
+	b, err := json.Marshal(ownerRecord{SchemaVersion: SchemaVersion, PlanID: planID})
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return err
+	}
+	_, writeErr := f.Write(b)
+	if writeErr == nil {
+		writeErr = f.Sync()
+	}
+	closeErr := f.Close()
+	if writeErr != nil {
+		_ = os.Remove(filename)
+		return writeErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(filename)
+		return closeErr
+	}
+	return nil
+}
+
+func finishOwnedStage(stage, planID string) error {
+	if err := recoverOwnedStage(stage, planID); err != nil {
+		return err
+	}
+	marker := filepath.Join(stage, stageOwnerFilename)
+	if err := os.Remove(marker); err != nil {
+		return err
+	}
+	return os.Remove(stage)
+}
+
+func validateStageForVerify(out, planID string) error {
+	stage := filepath.Join(out, stagingName)
+	info, err := os.Lstat(stage)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil // Legacy and completed exports have no staging directory.
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("staging path is not a real directory")
+	}
+	marker := filepath.Join(stage, stageOwnerFilename)
+	markerInfo, err := os.Lstat(marker)
+	if err != nil || markerInfo.Mode()&os.ModeSymlink != 0 || !markerInfo.Mode().IsRegular() {
+		return errors.New("staging ownership marker is missing or unsafe")
+	}
+	b, err := readJSONFile(marker, 4096)
+	if err != nil {
+		return err
+	}
+	var owner ownerRecord
+	if err := decodeStrict(b, &owner); err != nil || owner.SchemaVersion != SchemaVersion || owner.PlanID != planID {
+		return errors.New("staging ownership marker does not match the archive")
+	}
+	entries, err := os.ReadDir(stage)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.Name() == stageOwnerFilename {
+			continue
+		}
+		if !knownStageTempName(entry.Name()) {
+			return errors.New("staging directory contains an unrecognized entry")
+		}
+		st, err := os.Lstat(filepath.Join(stage, entry.Name()))
+		if err != nil || st.Mode()&os.ModeSymlink != 0 || !st.Mode().IsRegular() {
+			return errors.New("staging directory contains an unsafe temporary entry")
+		}
+		return errors.New("staging directory contains an unfinished temporary file")
+	}
+	return nil
+}
+
 func expectedTree(p *Plan) (map[string]bool, error) {
-	expected := map[string]bool{ownerFilename: true, manifestFilename: true}
+	expected := map[string]bool{ownerFilename: true, manifestFilename: true, lockFilename: true, stagingName: true}
+	expected[filepath.Join(stagingName, stageOwnerFilename)] = true
 	for _, f := range p.Files {
 		if err := addOutputPath(expected, f.OutputPath); err != nil {
 			return nil, err
@@ -261,6 +520,12 @@ func addOutputPath(expected map[string]bool, rel string) error {
 }
 
 func validateOwnedTree(out string, expected map[string]bool) error {
+	directories := make(map[string]bool, len(expected))
+	for key := range expected {
+		for parent := filepath.Dir(key); parent != "." && parent != string(os.PathSeparator); parent = filepath.Dir(parent) {
+			directories[parent] = true
+		}
+	}
 	return filepath.WalkDir(out, func(full string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -283,13 +548,7 @@ func validateOwnedTree(out string, expected map[string]bool) error {
 		if !expected[rel] {
 			return fmt.Errorf("output tree contains an unowned entry %q", rel)
 		}
-		wantDir := false
-		for key := range expected {
-			if strings.HasPrefix(key, rel+string(os.PathSeparator)) {
-				wantDir = true
-				break
-			}
-		}
+		wantDir := directories[rel]
 		if wantDir && !info.IsDir() {
 			return fmt.Errorf("output path component %q is not a directory", rel)
 		}

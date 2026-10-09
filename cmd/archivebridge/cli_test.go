@@ -21,7 +21,7 @@ func TestRunVersion(t *testing.T) {
 		if code != 0 {
 			t.Fatalf("Run exit code = %d, stderr = %q", code, stderr.String())
 		}
-		if got, want := stdout.String(), "ArchiveBridge 0.1.0 (development)\n"; got != want {
+		if got, want := stdout.String(), "ArchiveBridge 0.2.0 (development)\n"; got != want {
 			t.Fatalf("stdout = %q, want %q", got, want)
 		}
 		if stderr.Len() != 0 {
@@ -39,13 +39,19 @@ func TestRunVersion(t *testing.T) {
 		if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
 			t.Fatalf("stdout is not JSON: %v (%q)", err, stdout.String())
 		}
-		if got.SchemaVersion != cliSchemaVersion || got.Status != "ok" || got.Command != "version" || got.Version != "0.1.0" || got.Commit != "development" {
+		if got.SchemaVersion != cliSchemaVersion || got.Status != "ok" || got.Command != "version" || got.Version != "0.2.0" || got.Commit != "development" {
 			t.Fatalf("unexpected version response: %+v", got)
 		}
 		if stderr.Len() != 0 {
 			t.Fatalf("unexpected stderr: %q", stderr.String())
 		}
 	})
+}
+
+func TestErrorCodeOutputLockedIsStable(t *testing.T) {
+	if got := errorCode(bridge.ErrOutputLocked); got != "output_locked" {
+		t.Fatalf("errorCode(ErrOutputLocked) = %q, want output_locked", got)
+	}
 }
 
 func TestRunRejectsUnknownCommandAndArguments(t *testing.T) {
@@ -57,6 +63,8 @@ func TestRunRejectsUnknownCommandAndArguments(t *testing.T) {
 		{name: "unknown command", args: []string{"mystery"}, want: "UNKNOWN_COMMAND"},
 		{name: "extra argument", args: []string{"verify", "--archive", "archive-dir", "extra"}, want: "INVALID_ARGUMENT"},
 		{name: "unknown flag in JSON mode", args: []string{"verify", "--archive", "archive-dir", "--json", "--mystery"}, want: "INVALID_ARGUMENT"},
+		{name: "compare requires plan and archive", args: []string{"compare", "--json"}, want: "INVALID_ARGUMENT"},
+		{name: "compare rejects unknown flag", args: []string{"compare", "--plan", "plan.json", "--archive", "archive-dir", "--mystery"}, want: "INVALID_ARGUMENT"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -68,7 +76,7 @@ func TestRunRejectsUnknownCommandAndArguments(t *testing.T) {
 			if !strings.Contains(stderr.String(), tc.want) {
 				t.Fatalf("stderr %q does not contain error code %q", stderr.String(), tc.want)
 			}
-			if tc.args[0] == "verify" && tc.name == "unknown flag in JSON mode" {
+			if wantsJSON(tc.args) {
 				var got errorOutput
 				if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
 					t.Fatalf("stdout is not a JSON error: %v (%q)", err, stdout.String())
@@ -185,6 +193,27 @@ func TestRunArchiveWorkflow(t *testing.T) {
 		t.Fatalf("unexpected verify response: %+v", verifyResponse)
 	}
 
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run(context.Background(), []string{"compare", "--plan", planPath, "--archive", archiveDir, "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("compare exit code = %d, stdout = %q, stderr = %q", code, stdout.String(), stderr.String())
+	}
+	var compareResponse struct {
+		SchemaVersion int                  `json:"schemaVersion"`
+		Status        string               `json:"status"`
+		Command       string               `json:"command"`
+		Report        bridge.CompareReport `json:"report"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &compareResponse); err != nil {
+		t.Fatalf("compare output is not JSON: %v (%q)", err, stdout.String())
+	}
+	if compareResponse.SchemaVersion != cliSchemaVersion || compareResponse.Status != "ok" || compareResponse.Command != "compare" || compareResponse.Report.Status != "matched" || compareResponse.Report.PlanID != plan.ID || compareResponse.Report.ArchivePlanID != plan.ID || compareResponse.Report.MediaChecked != 1 {
+		t.Fatalf("unexpected compare response: %+v", compareResponse)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("unexpected compare stderr: %q", stderr.String())
+	}
+
 	tamperedPath := filepath.Join(archiveDir, filepath.FromSlash(plan.Files[0].OutputPath))
 	if err := os.WriteFile(tamperedPath, []byte("tampered bytes"), 0o600); err != nil {
 		t.Fatal(err)
@@ -207,6 +236,28 @@ func TestRunArchiveWorkflow(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "REPORT_FAILED") {
 		t.Fatalf("failed verify did not write a diagnostic: %q", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run(context.Background(), []string{"compare", "--plan", planPath, "--archive", archiveDir, "--json"}, &stdout, &stderr); code == 0 {
+		t.Fatal("compare succeeded after an exported file was changed")
+	}
+	var failedCompare struct {
+		SchemaVersion int                  `json:"schemaVersion"`
+		Status        string               `json:"status"`
+		Command       string               `json:"command"`
+		Error         errorDetails         `json:"error"`
+		Report        bridge.CompareReport `json:"report"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &failedCompare); err != nil {
+		t.Fatalf("failed compare output is not JSON: %v (%q)", err, stdout.String())
+	}
+	if failedCompare.SchemaVersion != cliSchemaVersion || failedCompare.Status != "error" || failedCompare.Command != "compare" || failedCompare.Error.Code != "REPORT_FAILED" || failedCompare.Report.Status != "mismatched" || len(failedCompare.Report.Mismatches) == 0 {
+		t.Fatalf("compare failure report was not preserved: %+v", failedCompare)
+	}
+	if !strings.Contains(stderr.String(), "REPORT_FAILED") {
+		t.Fatalf("failed compare did not write a diagnostic: %q", stderr.String())
 	}
 }
 

@@ -200,8 +200,7 @@ class InitializationSafetyTests(unittest.TestCase):
 
 
 class PackageValidationTests(unittest.TestCase):
-    def _fixture_entries(self, host_platform: str) -> tuple[str, str, dict[str, bytes], dict[str, object], bool]:
-        version = "0.1.0"
+    def _fixture_entries(self, host_platform: str, version: str = "0.1.0") -> tuple[str, str, dict[str, bytes], dict[str, object], bool]:
         tag = "win" if host_platform == "windows" else "linux"
         top = f"archivebridge-{version}-{tag}-x64"
         archive_name = top + (".zip" if host_platform == "windows" else ".tar.gz")
@@ -243,7 +242,7 @@ class PackageValidationTests(unittest.TestCase):
             "source": commit,
             "platform": host_platform,
             "arch": "x64",
-            "goVersion": acceptance.GO_VERSION,
+            "goVersion": "go1.27.0" if version == "0.1.0" else "go1.27.2",
             "files": [{"path": binary_name, "bytes": len(binary_bytes), "sha256": acceptance._sha256(binary_bytes)}],
         }
         entries = {
@@ -336,6 +335,28 @@ class PackageValidationTests(unittest.TestCase):
             self.assertEqual(report["archiveMemberCount"], len(manifest["files"]) + 1)
             if used_retained_release:
                 self.assertEqual(archive_name, "archivebridge-0.1.0-win-x64.zip")
+
+    def test_package_toolchain_is_pinned_by_release_version(self) -> None:
+        host = "windows" if platform.system().lower() == "windows" else "linux"
+        for version, toolchain in (("0.1.0", "go1.27.0"), ("0.2.0", "go1.27.2")):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as temporary:
+                top, name, entries, manifest, _ = self._fixture_entries(host, version)
+                manifest["goVersion"] = toolchain
+                entries[f"{top}/package-manifest.json"] = json.dumps(manifest).encode("utf-8")
+                package, binary, _ = self._materialize_fixture(Path(temporary), entries, top, name)
+                report = acceptance._validate_package(None, package, version, str(manifest["source"]), binary)
+                self.assertEqual(report["topDirectory"], top)
+
+    def test_other_release_toolchain_is_rejected(self) -> None:
+        host = "windows" if platform.system().lower() == "windows" else "linux"
+        for version, wrong_toolchain in (("0.1.0", "go1.27.2"), ("0.2.0", "go1.27.0")):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as temporary:
+                top, name, entries, manifest, _ = self._fixture_entries(host, version)
+                manifest["goVersion"] = wrong_toolchain
+                entries[f"{top}/package-manifest.json"] = json.dumps(manifest).encode("utf-8")
+                package, binary, _ = self._materialize_fixture(Path(temporary), entries, top, name)
+                with self.assertRaisesRegex(acceptance.AcceptanceFailure, "goVersion"):
+                    acceptance._validate_package(None, package, version, str(manifest["source"]), binary)
 
     def test_top_directory_normalization_rejects_outside_and_traversal_members(self) -> None:
         host = "windows" if platform.system().lower() == "windows" else "linux"

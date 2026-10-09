@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash } from 'node:crypto';
-import { lstat, readFile, stat, writeFile } from 'node:fs/promises';
+import { lstat, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { chromium } from 'playwright';
@@ -58,6 +58,7 @@ async function main() {
   let browser;
   let context;
   let page;
+  let outputAccepted = false;
   const externalSeen = new Set();
   const recordExternal = url => {
     if (!externalSeen.has(url)) {
@@ -75,6 +76,8 @@ async function main() {
     const outInfo = await stat(args.out);
     const outLinkInfo = await lstat(args.out);
     if (!outInfo.isDirectory() || outLinkInfo.isSymbolicLink()) throw new Error('--out must be a regular directory prepared by the acceptance runner');
+    if ((await readdir(args.out)).length !== 0) throw new Error('--out must be empty; existing evidence will not be replaced');
+    outputAccepted = true;
 
     browser = await chromium.launch({ headless: true, chromiumSandbox: true, args: ['--no-proxy-server'] });
     check(report, 'chromium-sandbox-requested', report.chromiumSandboxRequested,
@@ -146,6 +149,30 @@ async function main() {
     check(report, 'all-media-previews-render', previewCount === 6 && previewResults.length === 6 && previewResults.every(image => image.complete && image.width > 0 && image.height > 0),
       `Decoded ${previewResults.filter(image => image.width > 0 && image.height > 0).length} of ${previewCount} image previews.`, previewResults);
 
+    const provenanceManifest = await page.evaluate(async () => (await fetch('/api/manifest', { cache: 'no-store' })).json());
+    const cardSources = await page.locator('.card').evaluateAll(cards => cards.map(card => ({ path: card.querySelector('h3')?.title, source: card.querySelector('.source')?.textContent })));
+    check(report, 'occurrence-source-provenance', cardSources.length === 6 && cardSources.every(card => {
+      const occurrence = provenanceManifest.files.find(file => file.entryPath === card.path);
+      return occurrence && card.source === provenanceManifest.sources[occurrence.sourceIndex].name;
+    }), 'Every media occurrence visibly identifies its original source part.', cardSources);
+    const albumSources = await page.locator('#albums .album-source').allTextContents();
+    check(report, 'album-source-provenance', albumSources.length === 3 && provenanceManifest.albums.every((album, index) => {
+      const member = provenanceManifest.files.find(file => file.albumIds.includes(album.id));
+      return member && albumSources[index] === provenanceManifest.sources[member.sourceIndex].name;
+    }), 'Album controls retain source-part provenance instead of inferring a merged album identity.', albumSources);
+    await page.locator('#repeated').focus();
+    await page.keyboard.press('Enter');
+    const repeatedCards = await page.locator('.card').count();
+    const repeatedNames = await page.locator('.card h3').allTextContents();
+    const repeatedSources = await page.locator('.card .source').allTextContents();
+    check(report, 'repeated-content-preserves-occurrences', repeatedCards === 3 && repeatedNames.every(name => name === 'harbor.png') && new Set(repeatedSources).size === 2 && await page.locator('#repeat-note').isVisible(),
+      'The repeated-content view keeps all three identical originals and both source-part relationships visible.', { repeatedCards, repeatedNames, repeatedSources });
+    check(report, 'keyboard-navigation-state', await page.locator('#repeated').getAttribute('aria-pressed') === 'true' && await page.locator('#all').getAttribute('aria-pressed') === 'false' && await page.locator('#heading').innerText() === 'Repeated content',
+      'Native Enter activation updates the selected navigation state and heading.');
+    await page.locator('#all').click();
+    check(report, 'repeated-view-does-not-remove-files', await page.locator('.card').count() === 6 && await page.locator('#all').getAttribute('aria-pressed') === 'true',
+      'Returning to All media restores all six occurrences.');
+
     const familyButton = page.locator('#albums button.nav').filter({ hasText: /^Family\s*2?$/ });
     const familyButtons = page.locator('#albums button.nav').filter({ has: page.locator('span') });
     let familyFound = await familyButton.count();
@@ -175,6 +202,35 @@ async function main() {
 
     await page.locator('#metadata').selectOption('all');
     await page.locator('#all').click();
+    // Delay delivery of a genuine local response so cancellation is observable
+    // even for tiny fixtures. This proves UI cancellation, not a timed server
+    // load or operating-system cancellation boundary.
+    let releaseResponse;
+    let markResponseReady;
+    let markRouteDone;
+    const responseGate = new Promise(resolve => { releaseResponse = resolve; });
+    const responseReady = new Promise(resolve => { markResponseReady = resolve; });
+    const routeDone = new Promise(resolve => { markRouteDone = resolve; });
+    const verificationRoute = async route => {
+      try {
+        const response = await route.fetch();
+        markResponseReady(response.status());
+        await responseGate;
+        await route.fulfill({ response }).catch(error => {
+          if (!route.request().failure()?.errorText?.includes('ERR_ABORTED')) throw error;
+        });
+      } finally { markRouteDone(); }
+    };
+    await page.route('**/api/verify', verificationRoute);
+    await page.locator('#verify').click();
+    const delayedStatus = await responseReady;
+    await page.locator('#cancel-verify').click();
+    await page.waitForFunction(() => document.querySelector('#status')?.textContent === 'Verification cancelled. No integrity result was recorded.');
+    check(report, 'verification-cancellation', delayedStatus === 200 && await page.locator('#verify').isEnabled() && await page.locator('#cancel-verify').isHidden(),
+      'Cancelling a verification while a genuine HTTP 200 result was held for controlled delivery produces no success claim and permits retry.');
+    releaseResponse();
+    await routeDone;
+    await page.unroute('**/api/verify', verificationRoute);
     await page.locator('#verify').click();
     await page.waitForFunction(() => document.querySelector('#status')?.textContent?.startsWith('Verified 6 media and 7 sidecar references'));
     const verifiedStatus = await page.locator('#status').innerText();
@@ -195,14 +251,14 @@ async function main() {
       `Foreign Host=${hostileHost.status()}, foreign Origin=${hostileOrigin.status()}, POST=${writeAttempt.status()}.`,
       { foreignHostStatus: hostileHost.status(), foreignOriginStatus: hostileOrigin.status(), postStatus: writeAttempt.status() });
 
-    await page.screenshot({ path: path.join(args.out, 'desktop.png'), fullPage: true, animations: 'disabled' });
+    await writeFile(path.join(args.out, 'desktop.png'), await page.screenshot({ fullPage: true, animations: 'disabled' }), { flag: 'wx' });
     const desktopInfo = await stat(path.join(args.out, 'desktop.png'));
     const desktopBytes = await readFile(path.join(args.out, 'desktop.png'));
     report.screenshots.push({ path: 'desktop.png', bytes: desktopInfo.size, sha256: sha256(desktopBytes), viewport: { width: 1440, height: 1000 } });
     check(report, 'desktop-screenshot', desktopInfo.size > 0, 'Desktop screenshot was saved and hashed.');
 
     await page.setViewportSize({ width: 390, height: 844 });
-    await page.screenshot({ path: path.join(args.out, 'mobile.png'), fullPage: true, animations: 'disabled' });
+    await writeFile(path.join(args.out, 'mobile.png'), await page.screenshot({ fullPage: true, animations: 'disabled' }), { flag: 'wx' });
     const mobileInfo = await stat(path.join(args.out, 'mobile.png'));
     const mobileBytes = await readFile(path.join(args.out, 'mobile.png'));
     report.screenshots.push({ path: 'mobile.png', bytes: mobileInfo.size, sha256: sha256(mobileBytes), viewport: { width: 390, height: 844 } });
@@ -249,7 +305,7 @@ async function main() {
   }
 
   report.status = report.checks.length > 0 && report.checks.every(item => item.status === 'passed') ? 'passed' : 'failed';
-  if (args) {
+  if (args && outputAccepted) {
     try { await writeFile(path.join(args.out, 'browser-report.json'), `${JSON.stringify(report, null, 2)}\n`, { flag: 'wx' }); }
     catch (error) { check(report, 'browser-report-persisted', false, `Could not persist browser report: ${error}`); report.status = 'failed'; }
   }

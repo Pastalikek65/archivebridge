@@ -36,7 +36,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = Path(__file__).resolve()
 BROWSER_HARNESS = ROOT / "scripts" / "browser-tools" / "acceptance.mjs"
 SCHEMA_VERSION = 1
-GO_VERSION = "go1.27.0"
+GO_VERSION = "go1.27.2"
+RELEASE_GO_VERSIONS = {"0.1.0": "go1.27.0", "0.2.0": GO_VERSION, "1.0.0": GO_VERSION}
 SUPPORTED_VERSIONS = {"0.1.0", "0.2.0", "1.0.0"}
 FULL_COMMIT = re.compile(r"^[0-9a-fA-F]{40}$")
 PINNED_EXPECTED_SHA256 = "d612ec5d4a88f2cc8cb0b8ec475b5e7038ed025ccc88624746699ea846597a39"
@@ -346,7 +347,7 @@ def _validate_package(args: argparse.Namespace, package: Dict[str, Any], expecte
         "version": expected_version,
         "source": expected_commit,
         "arch": "x64",
-        "goVersion": GO_VERSION,
+        "goVersion": RELEASE_GO_VERSIONS.get(expected_version),
     }
     for key, expected in required.items():
         if manifest.get(key) != expected:

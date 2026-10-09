@@ -1,9 +1,9 @@
 # Roadmap
 
-The current MVP provides multipart ZIP/TAR.GZ inspection, explicit plans, original/sidecar export, manifest integrity verification, repeat/gracefully interrupted transfer and a read-only local viewer. It records supported dates and album relationships and exposes unresolved information. No qualified release exists until its matching release is published.
+MVP 0.1.0 is published for Windows x64 and Linux x64. It provides multipart ZIP/TAR.GZ inspection, explicit plans, original/sidecar export, manifest integrity verification, repeatable export and a read-only local viewer. It records supported dates and album relationships and exposes unresolved information. Its release evidence applies only to that version and the documented platform scope.
 
-Beta work will strengthen forced-interruption recovery, original-source/target comparison, duplicate review, keyboard and cancellation behavior, representative performance evidence and packaged installation checks.
+Beta 0.2.0 adds original-source/archive comparison and recovery after abrupt process termination. Its Windows/Linux acceptance workflow uses an actual terminated exporter, a second process resuming the same owned archive, published 0.1.0 compatibility packages and measured native-process workloads. This beta remains unqualified until the complete cross-platform workflow and review pass for the exact source and packages. Do not treat local development results as release evidence.
 
-The v1 goal adds an explicit Immich adapter, verifying uploaded originals and multi-album membership on a synthetic self-hosted server. Unsupported metadata fields and untested server versions remain visible. No automatic upload, deletion of originals or promise of finding every Takeout naming variation is planned.
+The next product goal adds an explicit Immich adapter, verifying uploaded originals and multi-album membership on a synthetic self-hosted server. Immich transfer is not in MVP or beta. Unsupported metadata fields and untested server versions will remain visible. No deletion of originals or promise of finding every Takeout naming variation is planned.
 
 Later possibilities include additional source formats, optional metadata transformations and filesystems without hard-link support. These are not current capabilities.

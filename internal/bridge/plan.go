@@ -228,6 +228,7 @@ func validatePlan(p *Plan, requirePaths bool) error {
 	}
 	mediaByID := make(map[string]MediaOccurrence, len(p.Files))
 	mediaBySourcePath := make(map[string]string, len(p.Files))
+	entryCategoryBySourcePath := make(map[string]string, len(p.Files)+len(p.Sidecars))
 	var expandedPayload int64
 	for _, f := range p.Files {
 		if !validID(f.ID) || f.SourceIndex < 0 || f.SourceIndex >= len(p.Sources) || f.Bytes < 0 || !validHexSHA(f.SHA256) || f.SHA256 == "" || !safeEntryPath(f.EntryPath) {
@@ -271,6 +272,7 @@ func validatePlan(p *Plan, requirePaths bool) error {
 			return errors.New("duplicate media source entry")
 		}
 		mediaBySourcePath[key] = f.ID
+		entryCategoryBySourcePath[key] = "media"
 	}
 	sidecarByID := make(map[string]Sidecar, len(p.Sidecars))
 	sidecarBySourcePath := make(map[string]bool, len(p.Sidecars))
@@ -292,7 +294,11 @@ func validatePlan(p *Plan, requirePaths bool) error {
 		if sidecarBySourcePath[key] {
 			return errors.New("duplicate sidecar source entry")
 		}
+		if entryCategoryBySourcePath[key] == "media" {
+			return errors.New("archive source entry cannot be both media and sidecar")
+		}
 		sidecarBySourcePath[key] = true
+		entryCategoryBySourcePath[key] = "sidecar"
 		if _, ok := sidecarByID[s.ID]; ok {
 			return errors.New("duplicate sidecar ID")
 		}

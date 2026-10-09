@@ -18,8 +18,8 @@ from typing import Optional
 
 
 PACKAGE_SCRIPT = Path(__file__).with_name("package.py").resolve()
-EXPECTED_GO_VERSION = "go1.27.0"
-VERSION = "0.1.0"
+EXPECTED_GO_VERSION = "go1.27.2"
+VERSION = "0.2.0"
 
 
 def native_platform() -> str:
@@ -84,7 +84,7 @@ class PackageFixture:
             "examples/sample/takeout-part-2.zip": b"sample fixture zip two\n",
             "examples/sample/expected.json": b'{"fixture":true}\n',
             ".gitignore": b"/bin/\n/release/\n/artifacts/\n",
-            "go.mod": b"module github.com/Pastalikek65/archivebridge\n\ngo 1.27.0\n",
+            "go.mod": b"module github.com/Pastalikek65/archivebridge\n\ngo 1.27.0\n\ntoolchain go1.27.2\n",
             "cmd/archivebridge/main.go": (
                 b'package main\n'
                 b'import ("fmt"; "os")\n'
@@ -173,7 +173,7 @@ class PackageFixture:
 class PackageTests(unittest.TestCase):
     def setUp(self) -> None:
         if current_go_version() != EXPECTED_GO_VERSION:
-            self.skipTest("package fixture requires the pinned Go 1.27.0 toolchain")
+            self.skipTest("package fixture requires the pinned Go 1.27.2 toolchain")
         self.platform_name = native_platform()
         self.temp = tempfile.TemporaryDirectory(prefix="archivebridge-package-test-")
         self.addCleanup(self.temp.cleanup)

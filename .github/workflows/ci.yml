@@ -15,21 +15,28 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
+          - os: windows-2025
             platform: windows
             binary: bin/archivebridge.exe
-            package: archivebridge-0.1.0-win-x64.zip
-            package_root: archivebridge-0.1.0-win-x64
-          - os: ubuntu-latest
+            package: archivebridge-0.2.0-win-x64.zip
+            package_root: archivebridge-0.2.0-win-x64
+            legacy_package: archivebridge-0.1.0-win-x64.zip
+            legacy_root: archivebridge-0.1.0-win-x64
+            legacy_sha256: 87eb4edeb56b82aeec5c0004f2e1b1829d642290a3dd94925365c777bbdc2932
+          - os: ubuntu-24.04
             platform: linux
             binary: bin/archivebridge
-            package: archivebridge-0.1.0-linux-x64.tar.gz
-            package_root: archivebridge-0.1.0-linux-x64
+            package: archivebridge-0.2.0-linux-x64.tar.gz
+            package_root: archivebridge-0.2.0-linux-x64
+            legacy_package: archivebridge-0.1.0-linux-x64.tar.gz
+            legacy_root: archivebridge-0.1.0-linux-x64
+            legacy_sha256: 0e6052432347504381fc7eddcbeff073d56f81cf79ffb5f8b583c5376836c0b0
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     env:
       NODE_USE_SYSTEM_CA: '1'
       npm_config_strict_ssl: 'true'
+      ARCHIVEBRIDGE_RUNNER_IMAGE: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -38,7 +45,7 @@ jobs:
 
       - uses: actions/setup-go@v7.0.0
         with:
-          go-version: '1.27.0'
+          go-version: '1.27.2'
           cache: false
 
       - uses: actions/setup-node@v7.1.0
@@ -58,6 +65,8 @@ jobs:
           import platform
           import subprocess
           import sys
+          if os.name == "nt":
+              import winreg
           from pathlib import Path
 
           def command(*args):
@@ -74,7 +83,10 @@ jobs:
           report = {
               "schemaVersion": 1,
               "runnerOS": os.environ.get("RUNNER_OS", ""),
+              "runnerImage": os.environ.get("ARCHIVEBRIDGE_RUNNER_IMAGE", ""),
+              "hostType": "GitHub-hosted runner",
               "platform": platform.platform(),
+              "platformVersion": platform.version(),
               "machine": machine,
               "architecture": platform.architecture()[0],
               "python": sys.version,
@@ -85,6 +97,35 @@ jobs:
               "nodeUsesSystemCA": os.environ.get("NODE_USE_SYSTEM_CA"),
               "commit": commit,
           }
+          if sys.platform.startswith("linux"):
+              try:
+                  os_release_text = Path("/etc/os-release").read_text(encoding="utf-8")
+                  os_release = {}
+                  for line in os_release_text.splitlines():
+                      key, separator, value = line.partition("=")
+                      if separator:
+                          os_release[key] = value.strip().strip('"')
+                  report["osRelease"] = os_release
+                  report["osReleaseText"] = os_release_text
+              except OSError as exc:
+                  raise SystemExit(f"cannot record /etc/os-release: {exc}")
+          elif sys.platform == "win32":
+              windows = sys.getwindowsversion()
+              with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion") as key:
+                  caption = winreg.QueryValueEx(key, "ProductName")[0]
+                  current_build = winreg.QueryValueEx(key, "CurrentBuildNumber")[0]
+                  try:
+                      update_build = winreg.QueryValueEx(key, "UBR")[0]
+                  except FileNotFoundError:
+                      update_build = None
+              report["windowsVersion"] = {
+                  "major": windows.major, "minor": windows.minor, "build": windows.build,
+                  "platform": windows.platform, "servicePack": windows.service_pack,
+                  "win32Version": platform.win32_ver(),
+                  "caption": caption,
+                  "registryBuild": current_build,
+                  "updateBuild": update_build,
+              }
           Path("artifacts/runner-info.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
           print(json.dumps(report, indent=2))
           PY
@@ -129,6 +170,26 @@ jobs:
             --stderr-log artifacts/acceptance-tests.stderr.log \
             -- python -B scripts/test_acceptance.py
 
+      - name: Beta recovery-harness regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -B scripts/ci-test-report.py \
+            --report artifacts/beta-acceptance-tests-report.json \
+            --stdout-log artifacts/beta-acceptance-tests.stdout.log \
+            --stderr-log artifacts/beta-acceptance-tests.stderr.log \
+            -- python -B scripts/test_beta_acceptance.py
+
+      - name: Independent beta acceptance process-ownership regression test
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -B scripts/ci-test-report.py \
+            --report artifacts/beta-independent-review-tests-report.json \
+            --stdout-log artifacts/beta-independent-review-tests.stdout.log \
+            --stderr-log artifacts/beta-independent-review-tests.stderr.log \
+            -- python -B scripts/test_beta_independent_review.py
+
       - name: Install pinned browser verification dependency
         shell: bash
         run: |
@@ -140,6 +201,16 @@ jobs:
             --stdout-log artifacts/npm-ci.stdout.log \
             --stderr-log artifacts/npm-ci.stderr.log \
             -- "$npm_cmd" ci --prefix scripts/browser-tools --strict-ssl=true
+
+      - name: Browser harness output-ownership regression test
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -B scripts/ci-test-report.py \
+            --report artifacts/browser-acceptance-tests-report.json \
+            --stdout-log artifacts/browser-acceptance-tests.stdout.log \
+            --stderr-log artifacts/browser-acceptance-tests.stderr.log \
+            -- python -B scripts/browser-tools/test_acceptance.py
 
       - name: Audit pinned browser verification dependency
         shell: bash
@@ -207,7 +278,7 @@ jobs:
             --stdout-log artifacts/go-build.stdout.log \
             --stderr-log artifacts/go-build.stderr.log \
             -- go build -buildvcs=true -trimpath \
-              -ldflags "-X main.version=0.1.0 -X main.commit=${GITHUB_SHA}" \
+              -ldflags "-X main.version=0.2.0 -X main.commit=${GITHUB_SHA}" \
               -o "${{ matrix.binary }}" ./cmd/archivebridge
 
       - name: Run source acceptance against fixtures and browser
@@ -220,10 +291,93 @@ jobs:
             --stderr-log artifacts/source-acceptance.stderr.log \
             -- python -B scripts/acceptance.py \
               --binary "${{ matrix.binary }}" \
-              --expected-version 0.1.0 \
+              --expected-version 0.2.0 \
               --expected-commit "$GITHUB_SHA" \
               --fixtures-dir examples/sample \
               --out "artifacts/source acceptance"
+
+      - name: Download and verify the published MVP compatibility package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $directory = Join-Path $env:RUNNER_TEMP 'archivebridge-mvp-0.1.0'
+          New-Item -ItemType Directory -Path $directory | Out-Null
+          $name = '${{ matrix.legacy_package }}'
+          $base = 'https://github.com/Pastalikek65/archivebridge/releases/download/v0.1.0'
+          $archive = Join-Path $directory $name
+          $checksums = Join-Path $directory 'published-SHA256SUMS.txt'
+          Invoke-WebRequest -Uri "$base/$name" -OutFile $archive
+          Invoke-WebRequest -Uri "$base/SHA256SUMS.txt" -OutFile $checksums
+          $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne '${{ matrix.legacy_sha256 }}') { throw 'Published MVP ZIP does not match the pinned release SHA-256.' }
+          $expectedLine = "${{ matrix.legacy_sha256 }}  $name"
+          $matching = @(Get-Content -LiteralPath $checksums | Where-Object { $_.TrimEnd("`r") -ceq $expectedLine })
+          if ($matching.Count -ne 1) { throw 'Published SHA256SUMS.txt does not bind the pinned MVP ZIP exactly once.' }
+          $unpacked = Join-Path $directory 'unpacked'
+          New-Item -ItemType Directory -Path $unpacked | Out-Null
+          Expand-Archive -LiteralPath $archive -DestinationPath $unpacked
+
+      - name: Download and verify the published MVP compatibility package (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          directory="$RUNNER_TEMP/archivebridge-mvp-0.1.0"
+          mkdir -p "$directory/unpacked"
+          name='${{ matrix.legacy_package }}'
+          base='https://github.com/Pastalikek65/archivebridge/releases/download/v0.1.0'
+          curl --proto '=https' --tlsv1.2 --fail --location --retry 3 "$base/$name" -o "$directory/$name"
+          curl --proto '=https' --tlsv1.2 --fail --location --retry 3 "$base/SHA256SUMS.txt" -o "$directory/published-SHA256SUMS.txt"
+          printf '%s  %s\n' '${{ matrix.legacy_sha256 }}' "$directory/$name" | sha256sum --check --status
+          grep -Fx -- '${{ matrix.legacy_sha256 }}  ${{ matrix.legacy_package }}' "$directory/published-SHA256SUMS.txt"
+          tar -xzf "$directory/$name" -C "$directory/unpacked"
+
+      - name: Run beta compare, forced-recovery, and published-MVP compatibility acceptance (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $directory = Join-Path $env:RUNNER_TEMP 'archivebridge-mvp-0.1.0'
+          $archive = Join-Path $directory '${{ matrix.legacy_package }}'
+          $checksums = Join-Path $directory 'published-SHA256SUMS.txt'
+          $root = Join-Path (Join-Path $directory 'unpacked') '${{ matrix.legacy_root }}'
+          python -B scripts/ci-test-report.py `
+            --report artifacts/beta-acceptance-command.json `
+            --stdout-log artifacts/beta-acceptance.stdout.log `
+            --stderr-log artifacts/beta-acceptance.stderr.log `
+            -- python -B scripts/beta-acceptance.py `
+              --binary '${{ matrix.binary }}' `
+              --expected-version 0.2.0 `
+              --expected-commit $env:GITHUB_SHA `
+              --fixtures-dir examples/sample `
+              --out 'artifacts/beta acceptance' `
+              --legacy-package $archive `
+              --legacy-package-root $root `
+              --legacy-package-sha256 '${{ matrix.legacy_sha256 }}' `
+              --legacy-published-checksum $checksums
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run beta compare, forced-recovery, and published-MVP compatibility acceptance (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          directory="$RUNNER_TEMP/archivebridge-mvp-0.1.0"
+          python -B scripts/ci-test-report.py \
+            --report artifacts/beta-acceptance-command.json \
+            --stdout-log artifacts/beta-acceptance.stdout.log \
+            --stderr-log artifacts/beta-acceptance.stderr.log \
+            -- python -B scripts/beta-acceptance.py \
+              --binary '${{ matrix.binary }}' \
+              --expected-version 0.2.0 \
+              --expected-commit "$GITHUB_SHA" \
+              --fixtures-dir examples/sample \
+              --out 'artifacts/beta acceptance' \
+              --legacy-package "$directory/${{ matrix.legacy_package }}" \
+              --legacy-package-root "$directory/unpacked/${{ matrix.legacy_root }}" \
+              --legacy-package-sha256 '${{ matrix.legacy_sha256 }}' \
+              --legacy-published-checksum "$directory/published-SHA256SUMS.txt"
 
       - name: Create native package in a fresh release directory
         shell: bash
@@ -235,7 +389,7 @@ jobs:
             --stderr-log artifacts/package.stderr.log \
             -- python -B scripts/package.py \
               --binary "${{ matrix.binary }}" \
-              --version 0.1.0 \
+              --version 0.2.0 \
               --source-commit "$GITHUB_SHA" \
               --platform "${{ matrix.platform }}" \
               --out release
@@ -266,12 +420,42 @@ jobs:
           Push-Location $away
           python -B $reporter --report $report --stdout-log $stdout --stderr-log $stderr -- python -B $acceptance `
             --binary (Join-Path $packageRoot 'archivebridge.exe') `
-            --expected-version 0.1.0 `
+            --expected-version 0.2.0 `
             --expected-commit $env:GITHUB_SHA `
             --fixtures-dir $fixtures `
             --out (Join-Path $repo 'artifacts\package acceptance') `
             --package $archive `
             --package-root $packageRoot
+          $code = $LASTEXITCODE
+          Pop-Location
+          if ($code -ne 0) { exit $code }
+
+          $legacyDirectory = Join-Path $env:RUNNER_TEMP 'archivebridge-mvp-0.1.0'
+          $legacyArchive = Join-Path $legacyDirectory '${{ matrix.legacy_package }}'
+          $legacyChecksums = Join-Path $legacyDirectory 'published-SHA256SUMS.txt'
+          $legacyRoot = Join-Path (Join-Path $legacyDirectory 'unpacked') '${{ matrix.legacy_root }}'
+          $betaBinary = Join-Path $packageRoot 'archivebridge.exe'
+          $betaChecksums = Join-Path $install 'SHA256SUMS.txt'
+          $betaHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          $betaReport = Join-Path $repo 'artifacts\package-beta-acceptance-command.json'
+          $betaStdout = Join-Path $repo 'artifacts\package-beta-acceptance.stdout.log'
+          $betaStderr = Join-Path $repo 'artifacts\package-beta-acceptance.stderr.log'
+          $betaAcceptance = Join-Path $repo 'scripts\beta-acceptance.py'
+          Push-Location $away
+          python -B $reporter --report $betaReport --stdout-log $betaStdout --stderr-log $betaStderr -- python -B $betaAcceptance `
+            --binary $betaBinary `
+            --expected-version 0.2.0 `
+            --expected-commit $env:GITHUB_SHA `
+            --fixtures-dir $fixtures `
+            --out (Join-Path $repo 'artifacts\package beta acceptance') `
+            --legacy-package $legacyArchive `
+            --legacy-package-root $legacyRoot `
+            --legacy-package-sha256 '${{ matrix.legacy_sha256 }}' `
+            --legacy-published-checksum $legacyChecksums `
+            --beta-package $archive `
+            --beta-package-root $packageRoot `
+            --beta-package-sha256 $betaHash `
+            --beta-published-checksum $betaChecksums
           $code = $LASTEXITCODE
           Pop-Location
           if ($code -ne 0) { exit $code }
@@ -297,12 +481,38 @@ jobs:
             --stderr-log "$GITHUB_WORKSPACE/artifacts/package-acceptance.stderr.log" \
             -- python -B "$GITHUB_WORKSPACE/scripts/acceptance.py" \
               --binary "$package_root/archivebridge" \
-              --expected-version 0.1.0 \
+              --expected-version 0.2.0 \
               --expected-commit "$GITHUB_SHA" \
               --fixtures-dir "$GITHUB_WORKSPACE/examples/sample" \
               --out "$GITHUB_WORKSPACE/artifacts/package acceptance" \
               --package "$archive" \
               --package-root "$package_root"
+
+          legacy_directory="$RUNNER_TEMP/archivebridge-mvp-0.1.0"
+          legacy_archive="$legacy_directory/${{ matrix.legacy_package }}"
+          legacy_checksums="$legacy_directory/published-SHA256SUMS.txt"
+          legacy_root="$legacy_directory/unpacked/${{ matrix.legacy_root }}"
+          beta_binary="$package_root/archivebridge"
+          beta_checksums="$install/SHA256SUMS.txt"
+          beta_hash=$(sha256sum -- "$archive" | cut -d ' ' -f 1)
+          python -B "$GITHUB_WORKSPACE/scripts/ci-test-report.py" \
+            --report "$GITHUB_WORKSPACE/artifacts/package-beta-acceptance-command.json" \
+            --stdout-log "$GITHUB_WORKSPACE/artifacts/package-beta-acceptance.stdout.log" \
+            --stderr-log "$GITHUB_WORKSPACE/artifacts/package-beta-acceptance.stderr.log" \
+            -- python -B "$GITHUB_WORKSPACE/scripts/beta-acceptance.py" \
+              --binary "$beta_binary" \
+              --expected-version 0.2.0 \
+              --expected-commit "$GITHUB_SHA" \
+              --fixtures-dir "$GITHUB_WORKSPACE/examples/sample" \
+              --out "$GITHUB_WORKSPACE/artifacts/package beta acceptance" \
+              --legacy-package "$legacy_archive" \
+              --legacy-package-root "$legacy_root" \
+              --legacy-package-sha256 '${{ matrix.legacy_sha256 }}' \
+              --legacy-published-checksum "$legacy_checksums" \
+              --beta-package "$archive" \
+              --beta-package-root "$package_root" \
+              --beta-package-sha256 "$beta_hash" \
+              --beta-published-checksum "$beta_checksums"
 
       - uses: actions/upload-artifact@v7.0.2
         if: always()

@@ -411,6 +411,7 @@ func applyMetadata(plan *Plan, members []scannedMember, sources []archiveSource,
 	}
 	associations := make([]association, 0)
 	ambiguousMedia := make(map[int]bool)
+	unmatchedMedia := make(map[int]bool)
 	sidecarIDs := make(map[string]string)
 	for _, sc := range plan.Sidecars {
 		sidecarIDs[fmt.Sprintf("%d\x00%s", sc.SourceIndex, sc.EntryPath)] = sc.ID
@@ -421,21 +422,35 @@ func applyMetadata(plan *Plan, members []scannedMember, sources []archiveSource,
 		}
 		id := sidecarIDs[fmt.Sprintf("%d\x00%s", m.source, m.path)]
 		folder := path.Dir(m.path)
-		candidates := make(map[int]bool)
+		filenameCandidates := make(map[int]bool)
 		if strings.HasSuffix(strings.ToLower(m.path), ".json") {
 			name := strings.TrimSuffix(m.path, path.Ext(m.path))
 			if idx, ok := mediaByEntry[m.source][name]; ok {
-				candidates[idx] = true
+				filenameCandidates[idx] = true
 			}
 		}
-		if m.metadata.valid && m.metadata.title != "" && !strings.ContainsAny(m.metadata.title, "/\\") && path.Base(m.metadata.title) == m.metadata.title {
+		candidates := make(map[int]bool, len(filenameCandidates)+1)
+		for idx := range filenameCandidates {
+			candidates[idx] = true
+		}
+		titlePresent := m.metadata.valid && m.metadata.title != ""
+		titleMatched := false
+		if titlePresent && !strings.ContainsAny(m.metadata.title, "/\\") && path.Base(m.metadata.title) == m.metadata.title {
 			target := m.metadata.title
 			if folder != "." {
 				target = path.Join(folder, target)
 			}
 			if idx, ok := mediaByEntry[m.source][target]; ok {
 				candidates[idx] = true
+				titleMatched = true
 			}
+		}
+		if titlePresent && !titleMatched && len(filenameCandidates) > 0 {
+			plan.Issues = append(plan.Issues, Issue{Code: "unmatched_metadata", SourceIndex: m.source, EntryPath: m.path, Details: "JSON sidecar title has no exact same-folder media match and was preserved unattached."})
+			for idx := range filenameCandidates {
+				unmatchedMedia[idx] = true
+			}
+			continue
 		}
 		if len(candidates) > 1 {
 			plan.Issues = append(plan.Issues, Issue{Code: "ambiguous_metadata", SourceIndex: m.source, EntryPath: m.path, Details: "JSON sidecar identifies more than one media occurrence and was not attached."})
@@ -464,6 +479,11 @@ func applyMetadata(plan *Plan, members []scannedMember, sources []archiveSource,
 	for idx := range ambiguousMedia {
 		if len(byMedia[idx]) == 0 {
 			plan.Files[idx].MetadataStatus = "ambiguous"
+		}
+	}
+	for idx := range unmatchedMedia {
+		if len(byMedia[idx]) == 0 && !ambiguousMedia[idx] {
+			plan.Files[idx].MetadataStatus = "unmatched"
 		}
 	}
 	for idx, items := range byMedia {

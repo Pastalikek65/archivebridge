@@ -122,7 +122,7 @@ func safeExit(ctx context.Context, args []string, stdout, stderr io.Writer) (exi
 
 func execute(ctx context.Context, args []string) (commandOutput, error) {
 	if len(args) == 0 {
-		return commandOutput{}, usageError("expected a command; use inspect, plan, export, resume, verify, serve, or version")
+		return commandOutput{}, usageError("expected a command; use inspect, plan, export, resume, verify, compare, serve, or version")
 	}
 
 	if args[0] == "--version" {
@@ -193,6 +193,23 @@ func execute(ctx context.Context, args []string) (commandOutput, error) {
 			return commandOutput{}, err
 		}
 		report, err := bridge.Verify(ctx, flags.archive)
+		if err != nil {
+			return commandOutput{}, err
+		}
+		if err := checkReportStatus(command, report.Status, report); err != nil {
+			return commandOutput{}, err
+		}
+		return commandOutput{SchemaVersion: cliSchemaVersion, Status: "ok", Command: command, Report: report}, nil
+	case "compare":
+		flags, err := parseCompare(args[1:])
+		if err != nil {
+			return commandOutput{}, err
+		}
+		plan, err := bridge.ReadPlan(flags.plan)
+		if err != nil {
+			return commandOutput{}, err
+		}
+		report, err := bridge.Compare(ctx, plan, flags.archive)
 		if err != nil {
 			return commandOutput{}, err
 		}
@@ -288,6 +305,30 @@ func parseArchive(command string, args []string) (parsedArchive, error) {
 	return parsed, nil
 }
 
+type parsedCompare struct{ plan, archive string }
+
+func parseCompare(args []string) (parsedCompare, error) {
+	fs := newFlagSet("compare")
+	var parsed parsedCompare
+	fs.StringVar(&parsed.plan, "plan", "", "inspection plan file")
+	fs.StringVar(&parsed.archive, "archive", "", "portable archive directory")
+	var asJSON bool
+	fs.BoolVar(&asJSON, "json", false, "write JSON to stdout")
+	if err := fs.Parse(args); err != nil {
+		return parsedCompare{}, usageError(err.Error())
+	}
+	if fs.NArg() != 0 {
+		return parsedCompare{}, usageError("unexpected positional argument: " + fs.Arg(0))
+	}
+	if strings.TrimSpace(parsed.plan) == "" {
+		return parsedCompare{}, usageError("--plan is required")
+	}
+	if strings.TrimSpace(parsed.archive) == "" {
+		return parsedCompare{}, usageError("--archive is required")
+	}
+	return parsed, nil
+}
+
 type parsedServe struct{ archive, listen string }
 
 func parseServe(args []string) (parsedServe, error) {
@@ -373,11 +414,13 @@ func checkReportStatus(command, status string, report any) error {
 		expected = "complete"
 	case "verify":
 		expected = "ok"
+	case "compare":
+		expected = "matched"
 	}
 	if status == expected {
 		return nil
 	}
-	if status == "failed" || status == "incomplete" || status == "error" {
+	if status == "failed" || status == "incomplete" || status == "error" || status == "mismatched" {
 		return &cliError{code: "REPORT_FAILED", message: fmt.Sprintf("%s reported status %q", command, status), report: report}
 	}
 	return &cliError{code: "UNKNOWN_STATUS", message: fmt.Sprintf("%s returned unrecognized status %q", command, status), report: report}
@@ -434,6 +477,9 @@ func reportFailure(stderr, stdout io.Writer, jsonMode bool, command string, err 
 }
 
 func errorCode(err error) string {
+	if errors.Is(err, bridge.ErrOutputLocked) {
+		return "output_locked"
+	}
 	var cliErr *cliError
 	if errors.As(err, &cliErr) {
 		return cliErr.code
@@ -475,6 +521,22 @@ func writeHuman(w io.Writer, result commandOutput) error {
 			return err
 		}
 		_, err := fmt.Fprintln(w, "Verification covers the files represented by this archive manifest; it does not establish whole-account coverage.")
+		return err
+	case "compare":
+		report := result.Report.(*bridge.CompareReport)
+		if _, err := fmt.Fprintf(w, "Comparison status: %s\nPlan ID: %s\nSource parts checked: %d\nMedia occurrences checked: %d\nSidecars checked: %d\nAlbums checked: %d\nMismatches: %d\n", report.Status, report.PlanID, report.SourcesChecked, report.MediaChecked, report.SidecarsChecked, report.AlbumsChecked, len(report.Mismatches)); err != nil {
+			return err
+		}
+		for _, mismatch := range report.Mismatches {
+			location := ""
+			if mismatch.EntryPath != "" {
+				location = mismatch.EntryPath + ": "
+			}
+			if _, err := fmt.Fprintf(w, "- [%s] %s%s\n", mismatch.Code, location, mismatch.Details); err != nil {
+				return err
+			}
+		}
+		_, err := fmt.Fprintln(w, "Comparison covers only the selected source parts and the files represented by this archive manifest; it does not establish whole-account coverage.")
 		return err
 	case "serve":
 		_, err := fmt.Fprintf(w, "ArchiveBridge read-only viewer stopped at %s\n", result.OutputPath)
