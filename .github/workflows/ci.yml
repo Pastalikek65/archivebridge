@@ -363,33 +363,396 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -B scripts/ci-test-report.py \
-            --report artifacts/immich-server-image-pull-report.json \
-            --stdout-log artifacts/immich-server-image-pull.stdout.log \
-            --stderr-log artifacts/immich-server-image-pull.stderr.log \
-            -- docker pull --platform linux/amd64 '${{ steps.immich_images.outputs.server }}'
+          mkdir -p artifacts
+          pull_pinned_image() {
+            local name="$1"
+            local image="$2"
+            local flat_report="$3"
+            local flat_stdout="$4"
+            local flat_stderr="$5"
+            local attempt attempt_dir rc delay classification
+
+            for attempt in 1 2 3; do
+              attempt_dir="artifacts/immich-${name}-image-pull-attempt-${attempt}"
+              mkdir "$attempt_dir"
+              if python -B scripts/ci-test-report.py \
+                --report "$attempt_dir/command.json" \
+                --stdout-log "$attempt_dir/stdout.log" \
+                --stderr-log "$attempt_dir/stderr.log" \
+                -- docker pull --platform linux/amd64 "$image"; then
+                rc=0
+              else
+                rc=$?
+              fi
+
+              if (( rc == 0 )); then
+                for path in "$flat_report" "$flat_stdout" "$flat_stderr"; do
+                  if [[ -e "$path" || -L "$path" ]]; then
+                    echo "Refusing to overwrite retained image-pull evidence: $path" >&2
+                    return 1
+                  fi
+                done
+                cp -- "$attempt_dir/command.json" "$flat_report"
+                cp -- "$attempt_dir/stdout.log" "$flat_stdout"
+                cp -- "$attempt_dir/stderr.log" "$flat_stderr"
+                return 0
+              fi
+
+              if classification="$(python -B - "$attempt_dir/command.json" \
+                "$attempt_dir/stdout.log" "$attempt_dir/stderr.log" "$rc" "$image" <<'PY'
+          import json
+          import os
+          import re
+          import stat
+          import sys
+
+          report_path, stdout_path, stderr_path, raw_status, image = sys.argv[1:]
+          def file_identity(info):
+              return (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode), info.st_size, info.st_mtime_ns)
+
+          def bounded_read(path, limit):
+              initial_path = os.lstat(path)
+              if not stat.S_ISREG(initial_path.st_mode) or initial_path.st_size > limit:
+                  raise ValueError("invalid or oversized evidence file")
+              flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+              descriptor = os.open(path, flags)
+              try:
+                  initial_fd = os.fstat(descriptor)
+                  if (not stat.S_ISREG(initial_fd.st_mode)
+                          or file_identity(initial_path) != file_identity(initial_fd)):
+                      raise ValueError("evidence changed before reading")
+                  contents = bytearray()
+                  while len(contents) < limit + 1:
+                      block = os.read(descriptor, min(64 * 1024, limit + 1 - len(contents)))
+                      if not block:
+                          break
+                      contents.extend(block)
+                  final_fd = os.fstat(descriptor)
+                  final_path = os.lstat(path)
+                  if (file_identity(initial_fd) != file_identity(final_fd)
+                          or file_identity(final_fd) != file_identity(final_path)
+                          or len(contents) != final_fd.st_size or len(contents) > limit):
+                      raise ValueError("evidence changed or exceeded its read bound")
+                  return bytes(contents)
+              finally:
+                  os.close(descriptor)
+
+          try:
+              status = int(raw_status)
+              report = json.loads(bounded_read(report_path, 64 * 1024).decode("utf-8"))
+              if (type(report.get("exitCode")) is not int or report["exitCode"] != status
+                      or report.get("command") != ["docker", "pull", "--platform", "linux/amd64", image]):
+                  raise ValueError("command report mismatch")
+              pieces = []
+              for log_path in (stdout_path, stderr_path):
+                  pieces.append(bounded_read(log_path, 8 * 1024 * 1024).decode("utf-8", "replace"))
+              text = "\n".join(pieces).lower()
+          except (OSError, ValueError, TypeError, json.JSONDecodeError):
+              print("unknown")
+              raise SystemExit(0)
+
+          transient = (
+              "toomanyrequests" in text
+              or "too many requests" in text
+              or "retry-after" in text
+              or "rate limit" in text
+              or ("429" in text and any(token in text for token in ("http", "status", "request", "registry")))
+              or (re.search(r"\b(?:502|503|504)\b", text) is not None
+                  and any(token in text for token in ("http", "status", "gateway", "unavailable", "bad gateway")))
+              or any(token in text for token in ("timeout", "timed out", "deadline exceeded"))
+              or any(token in text for token in ("connection reset", "reset by peer", "connection was reset"))
+          )
+          print("transient" if transient else "permanent")
+          PY
+              )"; then
+                :
+              else
+                echo "Could not classify Docker pull failure; preserving attempt evidence and stopping." >&2
+                return "$rc"
+              fi
+
+              if [[ "$classification" != transient ]]; then
+                echo "Docker pull failed with an unclassified or permanent error; preserving attempt evidence." >&2
+                return "$rc"
+              fi
+              if (( attempt == 3 )); then
+                echo "Docker pull exhausted three attempts; preserving all attempt evidence." >&2
+                return "$rc"
+              fi
+              delay=$((attempt * 5))
+              echo "Transient Docker registry/network failure for $name; retrying in ${delay}s (attempt $((attempt + 1))/3)." >&2
+              sleep "$delay"
+            done
+          }
+
+          pull_pinned_image server '${{ steps.immich_images.outputs.server }}' \
+            artifacts/immich-server-image-pull-report.json \
+            artifacts/immich-server-image-pull.stdout.log \
+            artifacts/immich-server-image-pull.stderr.log
 
       - name: Pull pinned Immich database image (Linux)
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
-          python -B scripts/ci-test-report.py \
-            --report artifacts/immich-database-image-pull-report.json \
-            --stdout-log artifacts/immich-database-image-pull.stdout.log \
-            --stderr-log artifacts/immich-database-image-pull.stderr.log \
-            -- docker pull --platform linux/amd64 '${{ steps.immich_images.outputs.database }}'
+          mkdir -p artifacts
+          pull_pinned_image() {
+            local name="$1"
+            local image="$2"
+            local flat_report="$3"
+            local flat_stdout="$4"
+            local flat_stderr="$5"
+            local attempt attempt_dir rc delay classification
+
+            for attempt in 1 2 3; do
+              attempt_dir="artifacts/immich-${name}-image-pull-attempt-${attempt}"
+              mkdir "$attempt_dir"
+              if python -B scripts/ci-test-report.py \
+                --report "$attempt_dir/command.json" \
+                --stdout-log "$attempt_dir/stdout.log" \
+                --stderr-log "$attempt_dir/stderr.log" \
+                -- docker pull --platform linux/amd64 "$image"; then
+                rc=0
+              else
+                rc=$?
+              fi
+
+              if (( rc == 0 )); then
+                for path in "$flat_report" "$flat_stdout" "$flat_stderr"; do
+                  if [[ -e "$path" || -L "$path" ]]; then
+                    echo "Refusing to overwrite retained image-pull evidence: $path" >&2
+                    return 1
+                  fi
+                done
+                cp -- "$attempt_dir/command.json" "$flat_report"
+                cp -- "$attempt_dir/stdout.log" "$flat_stdout"
+                cp -- "$attempt_dir/stderr.log" "$flat_stderr"
+                return 0
+              fi
+
+              if classification="$(python -B - "$attempt_dir/command.json" \
+                "$attempt_dir/stdout.log" "$attempt_dir/stderr.log" "$rc" "$image" <<'PY'
+          import json
+          import os
+          import re
+          import stat
+          import sys
+
+          report_path, stdout_path, stderr_path, raw_status, image = sys.argv[1:]
+          def file_identity(info):
+              return (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode), info.st_size, info.st_mtime_ns)
+
+          def bounded_read(path, limit):
+              initial_path = os.lstat(path)
+              if not stat.S_ISREG(initial_path.st_mode) or initial_path.st_size > limit:
+                  raise ValueError("invalid or oversized evidence file")
+              flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+              descriptor = os.open(path, flags)
+              try:
+                  initial_fd = os.fstat(descriptor)
+                  if (not stat.S_ISREG(initial_fd.st_mode)
+                          or file_identity(initial_path) != file_identity(initial_fd)):
+                      raise ValueError("evidence changed before reading")
+                  contents = bytearray()
+                  while len(contents) < limit + 1:
+                      block = os.read(descriptor, min(64 * 1024, limit + 1 - len(contents)))
+                      if not block:
+                          break
+                      contents.extend(block)
+                  final_fd = os.fstat(descriptor)
+                  final_path = os.lstat(path)
+                  if (file_identity(initial_fd) != file_identity(final_fd)
+                          or file_identity(final_fd) != file_identity(final_path)
+                          or len(contents) != final_fd.st_size or len(contents) > limit):
+                      raise ValueError("evidence changed or exceeded its read bound")
+                  return bytes(contents)
+              finally:
+                  os.close(descriptor)
+
+          try:
+              status = int(raw_status)
+              report = json.loads(bounded_read(report_path, 64 * 1024).decode("utf-8"))
+              if (type(report.get("exitCode")) is not int or report["exitCode"] != status
+                      or report.get("command") != ["docker", "pull", "--platform", "linux/amd64", image]):
+                  raise ValueError("command report mismatch")
+              pieces = []
+              for log_path in (stdout_path, stderr_path):
+                  pieces.append(bounded_read(log_path, 8 * 1024 * 1024).decode("utf-8", "replace"))
+              text = "\n".join(pieces).lower()
+          except (OSError, ValueError, TypeError, json.JSONDecodeError):
+              print("unknown")
+              raise SystemExit(0)
+
+          transient = (
+              "toomanyrequests" in text
+              or "too many requests" in text
+              or "retry-after" in text
+              or "rate limit" in text
+              or ("429" in text and any(token in text for token in ("http", "status", "request", "registry")))
+              or (re.search(r"\b(?:502|503|504)\b", text) is not None
+                  and any(token in text for token in ("http", "status", "gateway", "unavailable", "bad gateway")))
+              or any(token in text for token in ("timeout", "timed out", "deadline exceeded"))
+              or any(token in text for token in ("connection reset", "reset by peer", "connection was reset"))
+          )
+          print("transient" if transient else "permanent")
+          PY
+              )"; then
+                :
+              else
+                echo "Could not classify Docker pull failure; preserving attempt evidence and stopping." >&2
+                return "$rc"
+              fi
+
+              if [[ "$classification" != transient ]]; then
+                echo "Docker pull failed with an unclassified or permanent error; preserving attempt evidence." >&2
+                return "$rc"
+              fi
+              if (( attempt == 3 )); then
+                echo "Docker pull exhausted three attempts; preserving all attempt evidence." >&2
+                return "$rc"
+              fi
+              delay=$((attempt * 5))
+              echo "Transient Docker registry/network failure for $name; retrying in ${delay}s (attempt $((attempt + 1))/3)." >&2
+              sleep "$delay"
+            done
+          }
+
+          pull_pinned_image database '${{ steps.immich_images.outputs.database }}' \
+            artifacts/immich-database-image-pull-report.json \
+            artifacts/immich-database-image-pull.stdout.log \
+            artifacts/immich-database-image-pull.stderr.log
 
       - name: Pull pinned Immich cache image (Linux)
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
-          python -B scripts/ci-test-report.py \
-            --report artifacts/immich-cache-image-pull-report.json \
-            --stdout-log artifacts/immich-cache-image-pull.stdout.log \
-            --stderr-log artifacts/immich-cache-image-pull.stderr.log \
-            -- docker pull --platform linux/amd64 '${{ steps.immich_images.outputs.redis }}'
+          mkdir -p artifacts
+          pull_pinned_image() {
+            local name="$1"
+            local image="$2"
+            local flat_report="$3"
+            local flat_stdout="$4"
+            local flat_stderr="$5"
+            local attempt attempt_dir rc delay classification
+
+            for attempt in 1 2 3; do
+              attempt_dir="artifacts/immich-${name}-image-pull-attempt-${attempt}"
+              mkdir "$attempt_dir"
+              if python -B scripts/ci-test-report.py \
+                --report "$attempt_dir/command.json" \
+                --stdout-log "$attempt_dir/stdout.log" \
+                --stderr-log "$attempt_dir/stderr.log" \
+                -- docker pull --platform linux/amd64 "$image"; then
+                rc=0
+              else
+                rc=$?
+              fi
+
+              if (( rc == 0 )); then
+                for path in "$flat_report" "$flat_stdout" "$flat_stderr"; do
+                  if [[ -e "$path" || -L "$path" ]]; then
+                    echo "Refusing to overwrite retained image-pull evidence: $path" >&2
+                    return 1
+                  fi
+                done
+                cp -- "$attempt_dir/command.json" "$flat_report"
+                cp -- "$attempt_dir/stdout.log" "$flat_stdout"
+                cp -- "$attempt_dir/stderr.log" "$flat_stderr"
+                return 0
+              fi
+
+              if classification="$(python -B - "$attempt_dir/command.json" \
+                "$attempt_dir/stdout.log" "$attempt_dir/stderr.log" "$rc" "$image" <<'PY'
+          import json
+          import os
+          import re
+          import stat
+          import sys
+
+          report_path, stdout_path, stderr_path, raw_status, image = sys.argv[1:]
+          def file_identity(info):
+              return (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode), info.st_size, info.st_mtime_ns)
+
+          def bounded_read(path, limit):
+              initial_path = os.lstat(path)
+              if not stat.S_ISREG(initial_path.st_mode) or initial_path.st_size > limit:
+                  raise ValueError("invalid or oversized evidence file")
+              flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+              descriptor = os.open(path, flags)
+              try:
+                  initial_fd = os.fstat(descriptor)
+                  if (not stat.S_ISREG(initial_fd.st_mode)
+                          or file_identity(initial_path) != file_identity(initial_fd)):
+                      raise ValueError("evidence changed before reading")
+                  contents = bytearray()
+                  while len(contents) < limit + 1:
+                      block = os.read(descriptor, min(64 * 1024, limit + 1 - len(contents)))
+                      if not block:
+                          break
+                      contents.extend(block)
+                  final_fd = os.fstat(descriptor)
+                  final_path = os.lstat(path)
+                  if (file_identity(initial_fd) != file_identity(final_fd)
+                          or file_identity(final_fd) != file_identity(final_path)
+                          or len(contents) != final_fd.st_size or len(contents) > limit):
+                      raise ValueError("evidence changed or exceeded its read bound")
+                  return bytes(contents)
+              finally:
+                  os.close(descriptor)
+
+          try:
+              status = int(raw_status)
+              report = json.loads(bounded_read(report_path, 64 * 1024).decode("utf-8"))
+              if (type(report.get("exitCode")) is not int or report["exitCode"] != status
+                      or report.get("command") != ["docker", "pull", "--platform", "linux/amd64", image]):
+                  raise ValueError("command report mismatch")
+              pieces = []
+              for log_path in (stdout_path, stderr_path):
+                  pieces.append(bounded_read(log_path, 8 * 1024 * 1024).decode("utf-8", "replace"))
+              text = "\n".join(pieces).lower()
+          except (OSError, ValueError, TypeError, json.JSONDecodeError):
+              print("unknown")
+              raise SystemExit(0)
+
+          transient = (
+              "toomanyrequests" in text
+              or "too many requests" in text
+              or "retry-after" in text
+              or "rate limit" in text
+              or ("429" in text and any(token in text for token in ("http", "status", "request", "registry")))
+              or (re.search(r"\b(?:502|503|504)\b", text) is not None
+                  and any(token in text for token in ("http", "status", "gateway", "unavailable", "bad gateway")))
+              or any(token in text for token in ("timeout", "timed out", "deadline exceeded"))
+              or any(token in text for token in ("connection reset", "reset by peer", "connection was reset"))
+          )
+          print("transient" if transient else "permanent")
+          PY
+              )"; then
+                :
+              else
+                echo "Could not classify Docker pull failure; preserving attempt evidence and stopping." >&2
+                return "$rc"
+              fi
+
+              if [[ "$classification" != transient ]]; then
+                echo "Docker pull failed with an unclassified or permanent error; preserving attempt evidence." >&2
+                return "$rc"
+              fi
+              if (( attempt == 3 )); then
+                echo "Docker pull exhausted three attempts; preserving all attempt evidence." >&2
+                return "$rc"
+              fi
+              delay=$((attempt * 5))
+              echo "Transient Docker registry/network failure for $name; retrying in ${delay}s (attempt $((attempt + 1))/3)." >&2
+              sleep "$delay"
+            done
+          }
+
+          pull_pinned_image cache '${{ steps.immich_images.outputs.redis }}' \
+            artifacts/immich-cache-image-pull-report.json \
+            artifacts/immich-cache-image-pull.stdout.log \
+            artifacts/immich-cache-image-pull.stderr.log
 
       - name: Run real Immich integration against source binary (Linux)
         if: runner.os == 'Linux'
