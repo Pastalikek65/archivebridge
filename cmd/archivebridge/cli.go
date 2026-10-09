@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/Pastalikek65/archivebridge/internal/bridge"
+	"github.com/Pastalikek65/archivebridge/internal/immich"
 	"github.com/Pastalikek65/archivebridge/internal/webui"
 )
 
@@ -33,6 +34,7 @@ type commandOutput struct {
 	SchemaVersion       int    `json:"schemaVersion"`
 	Status              string `json:"status"`
 	Command             string `json:"command"`
+	HelpText            string `json:"help,omitempty"`
 	Version             string `json:"version,omitempty"`
 	Commit              string `json:"commit,omitempty"`
 	Plan                any    `json:"plan,omitempty"`
@@ -58,9 +60,11 @@ type cliError struct {
 	code    string
 	message string
 	report  any
+	cause   error
 }
 
 func (e *cliError) Error() string { return e.message }
+func (e *cliError) Unwrap() error { return e.cause }
 
 func usageError(message string) error {
 	return &cliError{code: "INVALID_ARGUMENT", message: message}
@@ -124,6 +128,9 @@ func execute(ctx context.Context, args []string) (commandOutput, error) {
 	if len(args) == 0 {
 		return commandOutput{}, usageError("expected a command; use inspect, plan, export, resume, verify, compare, serve, or version")
 	}
+	if args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
+		return commandOutput{SchemaVersion: cliSchemaVersion, Status: "ok", Command: "help", HelpText: topLevelHelp}, nil
+	}
 
 	if args[0] == "--version" {
 		_, err := parseVersionFlags(args[1:])
@@ -147,6 +154,8 @@ func execute(ctx context.Context, args []string) (commandOutput, error) {
 	}
 
 	switch command {
+	case "immich":
+		return executeImmich(ctx, args[1:])
 	case "inspect":
 		flags, err := parseSources("inspect", args[1:], false)
 		if err != nil {
@@ -433,6 +442,9 @@ func commandName(args []string) string {
 	if args[0] == "--version" {
 		return "version"
 	}
+	if args[0] == "immich" && len(args) > 1 {
+		return "immich." + args[1]
+	}
 	return args[0]
 }
 
@@ -480,6 +492,10 @@ func errorCode(err error) string {
 	if errors.Is(err, bridge.ErrOutputLocked) {
 		return "output_locked"
 	}
+	var immichErr *immich.Error
+	if errors.As(err, &immichErr) && immichErr.Code != "" {
+		return immichErr.Code
+	}
 	var cliErr *cliError
 	if errors.As(err, &cliErr) {
 		return cliErr.code
@@ -494,6 +510,10 @@ func writeJSON(w io.Writer, value any) error {
 }
 
 func writeHuman(w io.Writer, result commandOutput) error {
+	if result.HelpText != "" {
+		_, err := io.WriteString(w, result.HelpText)
+		return err
+	}
 	switch result.Command {
 	case "version":
 		_, err := fmt.Fprintf(w, "ArchiveBridge %s (%s)\n", result.Version, result.Commit)
@@ -541,6 +561,10 @@ func writeHuman(w io.Writer, result commandOutput) error {
 	case "serve":
 		_, err := fmt.Fprintf(w, "ArchiveBridge read-only viewer stopped at %s\n", result.OutputPath)
 		return err
+	case "immich.plan":
+		return writeImmichPlan(w, result.Report.(*immich.PlanReport))
+	case "immich.import", "immich.verify":
+		return writeImmichReport(w, result.Report.(*immich.Report), result.OutputPath)
 	default:
 		return errors.New("no human renderer for command")
 	}

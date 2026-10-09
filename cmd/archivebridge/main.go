@@ -7,7 +7,9 @@ import (
 )
 
 // These variables can be set by packaging builds with -ldflags.
-var version = "0.2.0"
+// The source tree targets the v1 release line; publication remains a separate
+// qualification decision. Packaging can override this with -ldflags.
+var version = "1.0.0"
 var commit = "development"
 
 func main() {

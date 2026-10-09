@@ -1173,8 +1173,8 @@ def _monitor_windows_process(child: subprocess.Popen[bytes], *, timeout_seconds:
 
 
 def _write_source_commit_identity(evidence: Evidence, expected_version: str, expected_commit: str, fixtures: Path, binary: Path, allow_development: bool) -> bool:
-    if expected_version != "0.2.0":
-        raise AcceptanceFailure("beta acceptance requires --expected-version 0.2.0")
+    if expected_version not in ("0.2.0", "1.0.0"):
+        raise AcceptanceFailure("native acceptance supports only --expected-version 0.2.0 or 1.0.0")
     development = expected_commit == DEVELOPMENT_COMMIT
     if development and not allow_development:
         raise AcceptanceFailure("development binaries require explicit --allow-development")
@@ -1212,10 +1212,12 @@ def _write_source_commit_identity(evidence: Evidence, expected_version: str, exp
     if payload.get("version") != expected_version or payload.get("commit") != expected_commit:
         raise AcceptanceFailure("native beta binary reports a different version or source commit")
     evidence.check("native-version-identity", True, "native beta binary reports its expected version and source identity", {"version": expected_version, "commit": expected_commit})
+    qualification_note = ("beta remains unqualified pending complete cross-platform review" if expected_version == "0.2.0"
+                          else "v1.0 source candidate remains unqualified pending complete cross-platform review")
     evidence.report["qualification"] = {"qualified": False, "scope": SOURCE_SCOPE,
                                          "expectedVersion": expected_version, "expectedCommit": expected_commit,
                                          "goVersion": binary_go_version, "hostGoVersion": host_go_version, "developmentBuild": development,
-                                         "note": "beta remains unqualified pending complete cross-platform review"}
+                                         "note": qualification_note}
     return development
 
 
@@ -1721,7 +1723,7 @@ def _binary_go_version(binary: Path) -> str:
 
 def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", required=True, help="native beta executable")
+    parser.add_argument("--binary", required=True, help="native 0.2.0 beta or 1.0.0 source-candidate executable")
     parser.add_argument("--expected-version", required=True)
     parser.add_argument("--expected-commit", required=True, help="full 40-character source commit, or development with --allow-development")
     parser.add_argument("--fixtures-dir", required=True, help="directory containing pinned sample ZIPs and expected.json")

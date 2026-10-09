@@ -29,6 +29,56 @@ SPEC.loader.exec_module(beta)
 
 
 class BetaAcceptanceSafetyTests(unittest.TestCase):
+    def test_source_identity_accepts_v1_candidate_and_preserves_beta(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixtures = root / "fixtures"
+            fixtures.mkdir()
+            binary = root / "archivebridge"
+            binary.write_bytes(b"native executable")
+            for version in ("0.2.0", "1.0.0"):
+                with self.subTest(version=version):
+                    expected = {
+                        "schemaVersion": beta.SCHEMA_VERSION,
+                        "command": "version",
+                        "status": "ok",
+                        "version": version,
+                        "commit": beta.DEVELOPMENT_COMMIT,
+                    }
+                    evidence = SimpleNamespace(
+                        report={"inputs": {}},
+                        run=lambda _name, _argv, **_kwargs: {
+                            "exitCode": 0, "stderr": "", "stdout": json.dumps(expected),
+                        },
+                        check=lambda *_args, **_kwargs: None,
+                    )
+                    host = SimpleNamespace(returncode=0, stdout="go version go1.27.2 windows/amd64")
+                    with mock.patch.object(beta.subprocess, "run", return_value=host), \
+                            mock.patch.object(beta, "_binary_go_version", return_value="go1.27.2"):
+                        development = beta._write_source_commit_identity(
+                            evidence, version, beta.DEVELOPMENT_COMMIT, fixtures, binary, True,
+                        )
+                    self.assertTrue(development)
+                    self.assertEqual(evidence.report["inputs"]["expectedVersion"], version)
+                    self.assertFalse(evidence.report["qualification"]["qualified"])
+                    if version == "0.2.0":
+                        self.assertEqual(evidence.report["qualification"]["note"],
+                                         "beta remains unqualified pending complete cross-platform review")
+                    else:
+                        self.assertIn("v1.0 source candidate remains unqualified", evidence.report["qualification"]["note"])
+
+    def test_source_identity_rejects_versions_outside_beta_and_v1(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixtures = root / "fixtures"
+            fixtures.mkdir()
+            binary = root / "archivebridge"
+            binary.write_bytes(b"native executable")
+            evidence = SimpleNamespace(report={"inputs": {}})
+            with self.assertRaisesRegex(beta.AcceptanceFailure, "0.2.0 or 1.0.0"):
+                beta._write_source_commit_identity(evidence, "0.1.0", beta.DEVELOPMENT_COMMIT,
+                                                   fixtures, binary, True)
+
     def test_file_record_binds_exact_path_size_and_sha256(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "published-package.zip"

@@ -1,11 +1,8 @@
 # Türkçe hızlı başlangıç
 
-ArchiveBridge, seçtiğin Google Photos Takeout parçalarını yerel bir arşive taşır. Orijinal dosyaları değiştirmez; fotoğraf tarihlerini, metadata eşleşmelerini ve albüm ilişkilerini bir manifestte saklar. Google hesabına giriş veya ücretli hizmet gerekmez.
+Bu sayfa ArchiveBridge 1.0 komutlarını anlatır. Hangi sürümlerin indirilebilir olduğunu, paket SHA-256 değerlerini ve o sürüme ait doğrulama kanıtlarını [Releases sayfasından](https://github.com/Pastalikek65/archivebridge/releases) kontrol et. Kanıtlar yalnızca aynı sürüm ve platform için geçerlidir. Önce `archivebridge --version --json` ile kullandığın ikili dosyanın sürümünü doğrula.
 
-1. Sürüm paketini indir, SHA-256 değerini kontrol et ve paketi aç.
-2. Tüm ilgili Takeout parçalarını `--source` ile seçerek planı oluştur.
-3. Yeni bir dizine aktar, ardından doğrula.
-4. Yerel arayüzü başlat ve albümleri incele.
+Takeout parçalarını seçerek yeni bir plan oluştur, sonra yeni bir dizine aktar ve doğrula:
 
 ```sh
 ./archivebridge plan --source parca-1.zip --source parca-2.zip --output plan.json
@@ -14,16 +11,35 @@ ArchiveBridge, seçtiğin Google Photos Takeout parçalarını yerel bir arşive
 ./archivebridge serve --archive fotograf-arsivi
 ```
 
-Windows'ta `./archivebridge` yerine `.\archivebridge.exe` kullan. Boşluk içeren yolları tırnak içine al. Arayüz `http://127.0.0.1:4175` adresinde açılır; Ctrl+C ile kapanır.
+Windows PowerShell'de `./archivebridge` yerine `.\archivebridge.exe` kullan. Boşluk içeren yolları tırnak içine al. Yerel arayüz `http://127.0.0.1:4175` adresinde açılır; Ctrl+C ile durdurulur.
 
-Çakışan metadata sessizce seçilmez; **Needs review** olarak görünür. Aynı içeriğe sahip medya tek dosyada tutulabilir, fakat kaynak görünümleri ve tüm albüm ilişkileri korunur. Kaynaklar silinmez. Timestamps manifestte UTC olarak tutulur; dosyanın indirme tarihiyle karıştırılmaz.
+Aktarmadan önce `inspect --source ...` ile içeriği inceleyebilirsin. `compare --plan plan.json --archive fotograf-arsivi` özgün kaynak parçalarını yeniden okur; bu parçalar planın kaydettiği konumlarda erişilebilir olmalıdır. Kesilen dışa aktarmayı `resume --plan plan.json --out fotograf-arsivi` ile sürdür. Mevcut dosyalar tekrar kullanımdan önce doğrulanır. Kaynaklar silinmez; aynı baytlara sahip tekrarlı öğeler tek içerik dosyası kullansa da tüm kaynak görünümleri ve albüm ilişkileri manifestte korunur.
 
-Kontrollü olarak kesilmiş aktarımı aynı planla sürdür:
+## Immich'e aktarım
+
+Immich bağdaştırıcısı ArchiveBridge 1.0.0 veya üstünü ve tam olarak Immich Server 3.3.1 sürümünü gerektirir. Önce yerel planı oluştur:
 
 ```sh
-./archivebridge resume --plan plan.json --out fotograf-arsivi
+./archivebridge immich plan --archive fotograf-arsivi --json
 ```
 
-Yayımlanmış 0.1.0 paketi, zarif iptalden sonra `resume` ile devam etmeyi destekler; mevcut dosyalar hash ile kontrol edilir ve bozuk ya da farklı dosyanın üzerine yazılmaz. `compare` ile ani süreç sonlandırması sonrası kurtarma, henüz yayımlanmamış 0.2 beta kaynak koduna aittir. Beta'yı denemek için Go 1.27.2 ile bu depoyu derle: Linux'ta `go build -trimpath -o archivebridge ./cmd/archivebridge`, Windows PowerShell'de `go build -trimpath -o archivebridge.exe ./cmd/archivebridge` kullan. Beta çapraz platform CI ve inceleme tamamlanana kadar nitelikli değildir. Kaynak arşivlerini, planı ve metadata'yı özel tut. Doğrulama seçilen arşiv parçaları ve manifest içindir; tüm hesabın eksiksiz yedeği veya manifestin imzalı doğruluğu anlamına gelmez.
+Varsayılan olarak tarihi eksik, bozuk, belirsiz veya çakışan öğeler planı engeller. `--skip-unresolved` açıkça seçilirse bu öğeler aktarılmaz ve raporda atlananlar olarak gösterilir. API anahtarını varsayılan `ARCHIVEBRIDGE_IMMICH_API_KEY` ortam değişkeninde tut; komut satırına yazma.
 
-`compare`, beta 0.2.0 derlemesinde planın işaret ettiği özgün arşivleri yeniden inceler ve planı manifest ile saklanan baytlarla karşılaştırır. Kaynak arşivleri özgün yollarında erişilebilir olmalıdır. Yayımlanmış 0.1.0 paketinde `compare` komutu bulunmaz.
+```sh
+./archivebridge immich import --archive fotograf-arsivi --server https://immich.example --report immich-aktarim.json
+./archivebridge immich verify --archive fotograf-arsivi --server https://immich.example --report immich-aktarim.json --output immich-dogrulama.json
+```
+
+Bağdaştırıcı değişiklik yapmadan önce sunucu sürümünü, hesabı ve gerekli API anahtarı izinlerini denetler. Yedi izin şunlardır: `asset.upload`, `asset.read`, `asset.download`, `album.read`, `album.create`, `albumAsset.create` ve `user.read`. `asset.update` ve içerik silme izinleri istenmez. HTTPS kullan. HTTP yalnızca `--allow-http-loopback` seçeneğiyle ve `127.0.0.1` veya `::1` gibi gerçek loopback IP adreslerinde kullanılabilir.
+
+Takeout özgün dosya sistemi değiştirilme zamanını sağlamaz. Hazır her yükleme özgün medya baytlarıyla birlikte, bilinen Takeout UTC tarihini taşıyan üretilmiş minimal, yalnızca tarih içeren bir XMP sidecar gönderir. Bu tarih Immich'in zorunlu `fileCreatedAt` ve `fileModifiedAt` alanlarında kullanılır; özgün dosya sistemi zamanı geri kazanılmış olmaz. Immich 3.3.1 metadata çalışanı işlemi tamamladıktan sonra `fileCreatedAt`, `fileModifiedAt` ve `ExifDateTimeOriginal` kaynak tarihiyle karşılaştırılır ve özgün medya baytları doğrulanır. Bu kontroller bitmeden yükleme hazır sayılmaz ve albüm değişiklikleri başlamaz. Mevcut bir öğenin tarihi çakışıyorsa metadata değiştirilmeden işlem reddedilir. Plan ve raporlardaki `dateTransferPolicy` değeri `takeout-date-authoritative-generated-xmp-v1` şeklindedir.
+
+İptal veya sınırlı metadata bekleme süresi Immich yüklemeyi kabul ettikten sonra gerçekleşirse kısmi rapor kabul edilmiş uzak öğenin kimliğini korur. Bu durumu yalnızca açık `--resume` ile uzlaştır; eski raporu değiştirme. Takeout'ın ham JSON sidecar dosyaları yerel arşivde kalır; açıklama ve GPS alanları Immich'e eşlenmez. Özgün medya baytları ve gömülü EXIF değişmez.
+
+Kesilen işlemi sürdürmek için önceki raporu oku ve yeni bir rapor yolu ver; eski rapor değiştirilmez:
+
+```sh
+./archivebridge immich import --archive fotograf-arsivi --server https://immich.example --resume eski-aktarim.json --report yeni-aktarim.json
+```
+
+Sürdürme aynı arşiv manifestini, sunucu sürümünü ve doğrulanmış hesabı gerektirir. Raporlar kaynak adları, albüm ayrıntıları, sunucu adresi, hesap kimliği ve işlem durumunu içerdiğinden gizli tutulmalıdır; API anahtarını içermezler. `immich verify` sunucuda değişiklik yapmaz. Bağdaştırıcı tüm hesabın aktarıldığını iddia etmez ve uzaktaki içerikleri silen bir komut sunmaz. Diğer sınırlamalar için [komut kılavuzuna](cli.md) ve [desteklenen biçimlere](support.md) bak.

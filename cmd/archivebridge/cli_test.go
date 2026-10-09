@@ -21,7 +21,7 @@ func TestRunVersion(t *testing.T) {
 		if code != 0 {
 			t.Fatalf("Run exit code = %d, stderr = %q", code, stderr.String())
 		}
-		if got, want := stdout.String(), "ArchiveBridge 0.2.0 (development)\n"; got != want {
+		if got, want := stdout.String(), "ArchiveBridge 1.0.0 (development)\n"; got != want {
 			t.Fatalf("stdout = %q, want %q", got, want)
 		}
 		if stderr.Len() != 0 {
@@ -39,7 +39,7 @@ func TestRunVersion(t *testing.T) {
 		if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
 			t.Fatalf("stdout is not JSON: %v (%q)", err, stdout.String())
 		}
-		if got.SchemaVersion != cliSchemaVersion || got.Status != "ok" || got.Command != "version" || got.Version != "0.2.0" || got.Commit != "development" {
+		if got.SchemaVersion != cliSchemaVersion || got.Status != "ok" || got.Command != "version" || got.Version != "1.0.0" || got.Commit != "development" {
 			t.Fatalf("unexpected version response: %+v", got)
 		}
 		if stderr.Len() != 0 {

@@ -1,51 +1,62 @@
 # ArchiveBridge
 
-Turn Google Photos Takeout parts into a local archive with original files, preserved sidecars, dates, album relationships, and an honest integrity report.
+ArchiveBridge reads selected Google Photos Takeout parts and stores original media, sidecars, supported dates, source occurrences, and album relationships in a local archive.
 
-[Download](https://github.com/Pastalikek65/archivebridge/releases) · [Quick start](#get-started) · [Türkçe](docs/quickstart-tr.md)
+[Releases](https://github.com/Pastalikek65/archivebridge/releases) · [Get started](#get-started) · [Türkçe hızlı başlangıç](docs/quickstart-tr.md) · [Verification](docs/verification.md)
 
-ArchiveBridge is for people who want to keep or move their photos without losing track of what transferred. It works locally, without a Google login, subscription, paid API, or upload service. The portable Windows/Linux command includes a read-only localhost viewer.
+This guide describes the ArchiveBridge 1.0.0 command set. The [Releases page](https://github.com/Pastalikek65/archivebridge/releases) shows which versions and platform packages are available. Match the package version to its release entry, checksum file, and version-specific evidence. Earlier-version evidence applies only to that version.
 
-The latest published release is MVP 0.1.0. This checkout contains 0.2.0 beta source; its new `compare` command and recovery after abrupt process termination are not in the published 0.1.0 packages. Beta cross-platform checks and review are pending, so a local source build is not a qualified release.
-
-![ArchiveBridge 0.2.0 beta source viewer browsing the included synthetic Takeout example](docs/demo.png)
-
-The real local viewer shows preserved album memberships and dates, with conflicting metadata left unresolved. Try this same synthetic archive using the commands below.
+![ArchiveBridge local viewer showing the included synthetic Takeout example](docs/demo.png)
 
 ## Get started
 
-Download the published MVP 0.1.0 package from [Releases](https://github.com/Pastalikek65/archivebridge/releases), verify its `SHA256SUMS.txt`, and extract it. Windows users can replace `./archivebridge` below with `.\archivebridge.exe`.
+The commands below require ArchiveBridge 1.0.0 or later. Check the installed version first. Use a 1.0.0 Windows x64 or Linux x64 package from Releases when that version is listed; otherwise build the 1.0.0 source as shown below. Verify each package against the `SHA256SUMS.txt` file from the same release entry before extracting it.
+
+On Linux, run the portable command from the extracted package directory:
 
 ```sh
+./archivebridge --version --json
 ./archivebridge plan --source takeout-part-1.zip --source takeout-part-2.zip --output plan.json
 ./archivebridge export --plan plan.json --out my-photo-archive
 ./archivebridge verify --archive my-photo-archive
 ./archivebridge serve --archive my-photo-archive
 ```
 
-Open `http://127.0.0.1:4175` to browse the archive, filter albums and metadata status, download originals, or run integrity verification. Stop the viewer with Ctrl+C. The viewer does not modify the archive.
-
-To inspect before writing a plan, use `inspect --source ...`. MVP 0.1.0 `resume` continues work after graceful cancellation or repeats an export; existing files are hashed before reuse. A mismatched file is reported, never silently overwritten. All data commands support `--json`.
-
-`compare` and recovery after abrupt process termination are beta 0.2.0 source features and require building this checkout; they are not available in the published MVP 0.1.0 download. To try them, install Go 1.27.2 and build from this checkout. On Linux, run:
-
-```sh
-go build -trimpath -o archivebridge ./cmd/archivebridge
-./archivebridge compare --plan plan.json --archive my-photo-archive
-```
-
-On Windows PowerShell, include the executable extension:
+On Windows PowerShell, use `archivebridge.exe`:
 
 ```powershell
-go build -trimpath -o archivebridge.exe ./cmd/archivebridge
-.\archivebridge.exe compare --plan plan.json --archive my-photo-archive
+.\archivebridge.exe --version --json
+.\archivebridge.exe plan --source takeout-part-1.zip --source takeout-part-2.zip --output plan.json
+.\archivebridge.exe export --plan plan.json --out my-photo-archive
+.\archivebridge.exe verify --archive my-photo-archive
+.\archivebridge.exe serve --archive my-photo-archive
 ```
 
-The beta remains unqualified until its Windows/Linux CI and review pass for the exact source and packages.
+Open `http://127.0.0.1:4175` to browse the archive, filter albums and metadata status, download originals, or run integrity verification. Stop the read-only viewer with Ctrl+C.
+
+Use `inspect --source ...` for a preview before writing a plan. Use `compare --plan plan.json --archive my-photo-archive` to recheck the original source parts against the plan and archive. Use `resume --plan plan.json --out my-photo-archive` to continue an export; existing files are verified before reuse. Keep the source parts available for compare and resume.
+
+## Import a selected archive into Immich
+
+The Immich adapter requires ArchiveBridge 1.0.0 or later and Immich server version 3.3.1 exactly. Review the local plan before importing. The API key is read from an environment variable and is never accepted as a command-line value.
+
+```sh
+./archivebridge immich plan --archive my-photo-archive --json
+./archivebridge immich import --archive my-photo-archive --server https://immich.example --report immich-import.json
+./archivebridge immich verify --archive my-photo-archive --server https://immich.example --report immich-import.json --output immich-verify.json
+```
+
+The default API-key variable is `ARCHIVEBRIDGE_IMMICH_API_KEY`. Set it before the import command. The adapter checks the server version, account, and seven required API-key permissions before it changes the server; it does not request `asset.update` or asset-delete permissions. The full permission list and recovery rules are in the [command guide](docs/cli.md).
+
+The default plan blocks media with missing, malformed, ambiguous, or conflicting dates. Add `--skip-unresolved` to leave those occurrences untransferred and record them as skips. Takeout provides no original filesystem modification time. For a ready upload, the adapter sends a generated minimal date-only XMP sidecar with the known Takeout UTC date and sets Immich's required `fileCreatedAt` and `fileModifiedAt` to that date. Immich's metadata worker must report matching dates, including `ExifDateTimeOriginal`, before the upload is marked ready or album changes begin. Plan and operation JSON identify this rule with `dateTransferPolicy=takeout-date-authoritative-generated-xmp-v1`. Original media bytes and embedded EXIF stay unchanged. Raw Takeout JSON sidecars remain local, and their caption or GPS fields are not mapped to Immich.
+
+An import report is private operation state. If cancellation or the bounded metadata-worker wait expires after Immich accepts an upload, the partial report retains its asset ID for explicit reconciliation. Resume with `--resume immich-import.json --report immich-resume.json`; the new report path must not exist. The prior report is preserved. Resume checks the archive, server, version, and authenticated account before reconciling incomplete operations. Protect reports because they contain source filenames, album details, server origin, and account identity. They do not contain the API key or its environment-variable name.
+
+The adapter uploads and verifies only the selected archive; it does not claim to transfer an entire account and has no remote-delete command. HTTPS is required. HTTP is permitted only with `--allow-http-loopback` and the literal loopback IP `127.0.0.1` or `::1`.
 
 ## Try the included example
 
-The package includes two small Takeout-shaped archives made entirely from synthetic images and metadata:
+The package includes two Takeout-shaped archives made from synthetic images and metadata. These commands create a local archive you can inspect without connecting to a service:
 
 ```sh
 ./archivebridge plan --source examples/sample/takeout-part-1.zip --source examples/sample/takeout-part-2.zip --output sample-plan.json
@@ -54,32 +65,37 @@ The package includes two small Takeout-shaped archives made entirely from synthe
 ./archivebridge serve --archive sample-archive
 ```
 
-The example contains six media occurrences, four distinct media contents, seven sidecars and three albums. One media file has conflicting sidecars; it remains visibly unresolved. Sharing identical stored bytes retains every source occurrence and album relationship. No source file is removed or changed.
+The example contains six media occurrences, four distinct media contents, seven sidecars, and three albums. One media occurrence has conflicting sidecars, so it remains unresolved. Identical content can share stored bytes while every source occurrence and album relationship remains in the manifest.
 
-## What is preserved
+## What the archive preserves
 
-- Original supported photo/video bytes and every JSON sidecar, with SHA-256 identities.
-- Source occurrences and album membership, including media appearing in several albums.
-- Supported sidecar timestamps as separate UTC manifest fields; original embedded metadata remains in the unchanged original bytes.
-- Missing, ambiguous, malformed and unsupported information as visible transfer notes.
+- Original supported photo and video bytes, plus every raw JSON sidecar
+- Source occurrences and album membership, including repeated media
+- Supported sidecar timestamps as separate UTC manifest dates
+- Unresolved and unsupported information as visible issues
 
-ZIP and TAR.GZ parts are read together. Matching uses exact supported same-folder filenames and metadata titles. Archive naming variants outside those rules remain unresolved. Unknown archive members are listed rather than presented as transferred. The result covers only the parts you selected, not your entire account.
+ZIP and TAR.GZ parts are read together. Matching uses supported exact same-folder names or unique metadata titles. Unknown members are listed and are not presented as transferred media. The archive covers only the selected parts. It does not prove account completeness or repair, decode, or decrypt source files.
 
-Integrity verification checks stored bytes against an unsigned manifest. It does not authenticate that manifest. Plans contain private local source paths; portable manifests omit them. Keep plans and exported metadata private.
+Local archive verification checks stored bytes against an unsigned manifest; it does not authenticate the manifest. Plans contain private local source paths. Keep plans, archives, and Immich reports private.
 
-Beta recovery retains an owned checkpoint after abrupt process termination and resumes it under an exclusive writer lock. The beta acceptance harness exercises a real child-process kill and recovery on Windows and Linux; those results remain subject to the pending CI run and review. Keep original sources available and do not remove ArchiveBridge ownership or staging files by hand.
-
-See [supported formats and limits](docs/support.md), [the command guide](docs/cli.md), [architecture](docs/architecture.md), and [Türkçe hızlı başlangıç](docs/quickstart-tr.md). [Verification](docs/verification.md) records tested release scope; [the roadmap](docs/roadmap.md) distinguishes current capabilities from planned work.
+See [supported formats and limits](docs/support.md), the [command guide](docs/cli.md), [architecture](docs/architecture.md), [roadmap](docs/roadmap.md), [verification](docs/verification.md), and [Türkçe hızlı başlangıç](docs/quickstart-tr.md).
 
 ## Build from source
 
-Go 1.27.2 is required to build this beta checkout; downloaded packages require no Go, Python or Node installation.
+Go 1.27.2 is required to build this source tree. Downloaded packages require no Go, Python, or Node installation.
+
+On Linux, build and test with:
 
 ```sh
 go test ./...
 go build -trimpath -o archivebridge ./cmd/archivebridge
 ```
 
-On Windows, use `go build -trimpath -o archivebridge.exe ./cmd/archivebridge` so the command has the expected executable name.
+On Windows, include the executable extension:
 
-The browser test and packaging tools are development dependencies, separate from the application. See [contributing](CONTRIBUTING.md). Application code is Apache-2.0; bundled Go runtime/standard-library notices are in [third_party](third_party/README.md).
+```powershell
+go test ./...
+go build -trimpath -o archivebridge.exe ./cmd/archivebridge
+```
+
+The browser and packaging tools are development tools, not application dependencies. See [contributing](CONTRIBUTING.md). Application code is Apache-2.0; bundled Go runtime and standard-library notices are in [third_party](third_party/README.md).

@@ -18,19 +18,29 @@ jobs:
           - os: windows-2025
             platform: windows
             binary: bin/archivebridge.exe
-            package: archivebridge-0.2.0-win-x64.zip
-            package_root: archivebridge-0.2.0-win-x64
+            package: archivebridge-1.0.0-win-x64.zip
+            package_root: archivebridge-1.0.0-win-x64
             legacy_package: archivebridge-0.1.0-win-x64.zip
             legacy_root: archivebridge-0.1.0-win-x64
             legacy_sha256: 87eb4edeb56b82aeec5c0004f2e1b1829d642290a3dd94925365c777bbdc2932
+            legacy_sums_sha256: ea707fe62f41f5d4d7325ae743bbc1090aa13cf2b67215795ef152672523988c
+            beta_package: archivebridge-0.2.0-win-x64.zip
+            beta_root: archivebridge-0.2.0-win-x64
+            beta_sha256: f58f998fd72fc5429f8372c433335c5e7dc0b808e2c4c55b3bdc379ad12881d4
+            beta_sums_sha256: aad4c9bbc1f7322fbb797784dcbc4d2a1885c70ef4dc179eab6934f667ffde79
           - os: ubuntu-24.04
             platform: linux
             binary: bin/archivebridge
-            package: archivebridge-0.2.0-linux-x64.tar.gz
-            package_root: archivebridge-0.2.0-linux-x64
+            package: archivebridge-1.0.0-linux-x64.tar.gz
+            package_root: archivebridge-1.0.0-linux-x64
             legacy_package: archivebridge-0.1.0-linux-x64.tar.gz
             legacy_root: archivebridge-0.1.0-linux-x64
             legacy_sha256: 0e6052432347504381fc7eddcbeff073d56f81cf79ffb5f8b583c5376836c0b0
+            legacy_sums_sha256: ea707fe62f41f5d4d7325ae743bbc1090aa13cf2b67215795ef152672523988c
+            beta_package: archivebridge-0.2.0-linux-x64.tar.gz
+            beta_root: archivebridge-0.2.0-linux-x64
+            beta_sha256: a19c267efd936c11f3925464ac543bca8806d4dc65772c6380c285912215d2e2
+            beta_sums_sha256: aad4c9bbc1f7322fbb797784dcbc4d2a1885c70ef4dc179eab6934f667ffde79
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     env:
@@ -190,6 +200,36 @@ jobs:
             --stderr-log artifacts/beta-independent-review-tests.stderr.log \
             -- python -B scripts/test_beta_independent_review.py
 
+      - name: Immich integration harness unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -B scripts/ci-test-report.py \
+            --report artifacts/immich-integration-tests-report.json \
+            --stdout-log artifacts/immich-integration-tests.stdout.log \
+            --stderr-log artifacts/immich-integration-tests.stderr.log \
+            -- python -B scripts/test_immich_integration.py
+
+      - name: Independent Immich harness regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -B scripts/ci-test-report.py \
+            --report artifacts/immich-independent-tests-report.json \
+            --stdout-log artifacts/immich-independent-tests.stdout.log \
+            --stderr-log artifacts/immich-independent-tests.stderr.log \
+            -- python -B scripts/test_immich_independent.py
+
+      - name: V1 published-package compatibility helper tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -B scripts/ci-test-report.py \
+            --report artifacts/v1-compatibility-tests-report.json \
+            --stdout-log artifacts/v1-compatibility-tests.stdout.log \
+            --stderr-log artifacts/v1-compatibility-tests.stderr.log \
+            -- python -B scripts/test_v1_compatibility.py
+
       - name: Install pinned browser verification dependency
         shell: bash
         run: |
@@ -278,7 +318,7 @@ jobs:
             --stdout-log artifacts/go-build.stdout.log \
             --stderr-log artifacts/go-build.stderr.log \
             -- go build -buildvcs=true -trimpath \
-              -ldflags "-X main.version=0.2.0 -X main.commit=${GITHUB_SHA}" \
+              -ldflags "-X main.version=1.0.0 -X main.commit=${GITHUB_SHA}" \
               -o "${{ matrix.binary }}" ./cmd/archivebridge
 
       - name: Run source acceptance against fixtures and browser
@@ -291,10 +331,216 @@ jobs:
             --stderr-log artifacts/source-acceptance.stderr.log \
             -- python -B scripts/acceptance.py \
               --binary "${{ matrix.binary }}" \
-              --expected-version 0.2.0 \
+              --expected-version 1.0.0 \
               --expected-commit "$GITHUB_SHA" \
               --fixtures-dir examples/sample \
               --out "artifacts/source acceptance"
+
+      - name: Resolve the tested Immich helper image pins (Linux)
+        if: runner.os == 'Linux'
+        id: immich_images
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -B scripts/ci-test-report.py \
+            --report artifacts/immich-image-pins-report.json \
+            --stdout-log artifacts/immich-image-pins.stdout.log \
+            --stderr-log artifacts/immich-image-pins.stderr.log \
+            -- python -B -c '
+          import importlib.util, json, os
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location("immich_integration", "scripts/immich-integration.py")
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              for name, image in sorted(module.IMAGES.items()):
+                  output.write(f"{name}={image}\n")
+          print(json.dumps(module.IMAGES, sort_keys=True))
+          '
+
+      - name: Pull pinned Immich server image (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -B scripts/ci-test-report.py \
+            --report artifacts/immich-server-image-pull-report.json \
+            --stdout-log artifacts/immich-server-image-pull.stdout.log \
+            --stderr-log artifacts/immich-server-image-pull.stderr.log \
+            -- docker pull --platform linux/amd64 '${{ steps.immich_images.outputs.server }}'
+
+      - name: Pull pinned Immich database image (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -B scripts/ci-test-report.py \
+            --report artifacts/immich-database-image-pull-report.json \
+            --stdout-log artifacts/immich-database-image-pull.stdout.log \
+            --stderr-log artifacts/immich-database-image-pull.stderr.log \
+            -- docker pull --platform linux/amd64 '${{ steps.immich_images.outputs.database }}'
+
+      - name: Pull pinned Immich cache image (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -B scripts/ci-test-report.py \
+            --report artifacts/immich-cache-image-pull-report.json \
+            --stdout-log artifacts/immich-cache-image-pull.stdout.log \
+            --stderr-log artifacts/immich-cache-image-pull.stderr.log \
+            -- docker pull --platform linux/amd64 '${{ steps.immich_images.outputs.redis }}'
+
+      - name: Run real Immich integration against source binary (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -B scripts/ci-test-report.py \
+            --report artifacts/immich-source-integration-command.json \
+            --stdout-log artifacts/immich-source-integration.stdout.log \
+            --stderr-log artifacts/immich-source-integration.stderr.log \
+            -- python -B scripts/immich-integration.py \
+              --binary bin/archivebridge \
+              --expected-version 1.0.0 \
+              --expected-commit "$GITHUB_SHA" \
+              --out "artifacts/immich source integration"
+          python -B scripts/ci-test-report.py \
+            --report artifacts/immich-source-integration-validation-command.json \
+            --stdout-log artifacts/immich-source-integration-validation.stdout.log \
+            --stderr-log artifacts/immich-source-integration-validation.stderr.log \
+            -- python -B -c '
+          import json
+          from pathlib import Path
+          import collections, datetime as dt, hashlib, os, re
+          report_path = Path("artifacts/immich source integration/integration-report.json")
+          report = json.loads(report_path.read_text(encoding="utf-8"))
+          checks = report.get("checks")
+          binary = report.get("binary", {})
+          expected_checks = [
+              "pinned_images", "loopback_only", "exact_server_version", "synthetic_account", "seven_scoped_key",
+              "offline_unicode_preview", "remote_original_sha256", "source_date", "unicode_filename",
+              "duplicate_content_multi_album", "readonly_remote_verification", "repeat_no_extra_resources",
+              "seven_scope_preflight", "same_account_key_rotation_resume", "different_account_resume_refused",
+              "source_dates_after_real_metadata_workers", "ambiguous_default_blocked_before_writes",
+              "explicit_skips_and_excluded_relationships", "raw_sidecars_not_transferred",
+              "skip_aware_readonly_verification", "skip_aware_resume", "accepted_upload_response_interruption",
+              "durable_in_flight_journal", "explicit_resume_reconciles_full_sha256", "no_blind_upload_retry",
+              "prior_resume_report_preserved", "takeout_date_survives_conflicting_embedded_exif_after_workers",
+          ]
+          def require(value, message):
+              if not value:
+                  raise SystemExit(message)
+          assert report.get("status") == "passed" and report.get("scope") == "native-real-immich-synthetic"
+          assert report.get("qualification") is False and report.get("cleanup") == "passed"
+          assert report.get("platform") == "Linux" and checks == expected_checks and len(set(checks)) == 27
+          assert report.get("synthetic") is True and report.get("serverVersion") == "3.3.1"
+          assert report.get("workers") == {"api": True, "microservices": True, "machineLearning": False}
+          assert binary.get("version") == "1.0.0" and binary.get("commit") == __import__("os").environ["GITHUB_SHA"]
+          helper_bytes = Path("scripts/immich-integration.py").read_bytes()
+          helper = report.get("harness", {})
+          require(helper == {"name": "immich-integration.py", "bytes": len(helper_bytes),
+                             "sha256": hashlib.sha256(helper_bytes).hexdigest()}, "SOURCE_HELPER_IDENTITY_MISMATCH")
+          binary_path = Path("bin/archivebridge").resolve(strict=True)
+          binary_bytes = binary_path.read_bytes()
+          require(type(binary.get("bytes")) is int and binary["bytes"] == len(binary_bytes)
+                  and binary.get("sha256") == hashlib.sha256(binary_bytes).hexdigest(), "SOURCE_BINARY_IDENTITY_MISMATCH")
+          commands = report.get("commands")
+          command_names = ["version", "plan", "export", "immich", "immich", "immich", "immich", "plan", "export",
+                           "immich", "immich", "immich", "plan", "export", "immich", "immich", "immich", "immich",
+                           "immich", "plan", "export", "immich", "immich", "immich", "plan", "export", "immich",
+                           "immich", "immich"]
+          require(isinstance(commands, list) and len(commands) == 29, "NATIVE_COMMAND_COUNT_MISMATCH")
+          for index, (command, expected_name) in enumerate(zip(commands, command_names), 1):
+              args = command.get("arguments")
+              require(type(command.get("number")) is int and command["number"] == index
+                      and isinstance(args, list) and args and args[0] == expected_name
+                      and type(command.get("exitCode")) is int, "NATIVE_COMMAND_INVENTORY_MISMATCH")
+              expected_failure = index in {10, 12, 15, 16, 22}
+              require((command["exitCode"] != 0) == expected_failure, "NATIVE_COMMAND_RESULT_MISMATCH")
+          require(commands[21].get("termination") == "forced-owned-child-after-server-accepted-upload"
+                  and type(commands[21].get("pid")) is int and commands[21]["pid"] > 0,
+                  "FORCED_INTERRUPTION_EVIDENCE_MISSING")
+          expected_dates = {
+              "83807b4ef61c1d03497a389abee15f67f36fbc10506f767fdd69c1a044594153": ("2023-11-14T22:13:20Z", 2),
+              "f9454317f83e5d8ab90431433bbe6a345f69f5d213138756db22e825168d034c": ("2023-11-15T22:13:20Z", 1),
+              "932e3e709ffde373c75b1d6724b5d005aea9d5736c1bd119be867014a88f511c": ("2023-11-14T22:13:20Z", 1),
+              "e898e7ad061e3e93536b44daba1ee0a5d1b548a42d3fe32f817978257f711109": ("2023-11-14T22:13:19Z", 1),
+              "26875c6fd8f73fffc3cc259086fa808ec22003ee20d5e69e9df1335a0d0ba058": ("2023-11-14T22:13:20Z", 1),
+          }
+          observations = report.get("metadataObservations")
+          require(isinstance(observations, list) and len(observations) == 6, "METADATA_OBSERVATION_COUNT_MISMATCH")
+          observed_counts, ids_by_sha, seen_assets = collections.Counter(), {}, {}
+          expected_fields = {"assetId", "mediaSHA256", "expectedSourceDate", "fileCreatedAt", "exifImageWidth",
+                             "exifImageHeight", "dateTimeOriginal"}
+          def parse_utc(value):
+              parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+              require(parsed.tzinfo is not None, "METADATA_TIMESTAMP_MISSING_TIMEZONE")
+              return parsed.astimezone(dt.timezone.utc)
+          for observation in observations:
+              require(isinstance(observation, dict) and set(observation) == expected_fields,
+                      "METADATA_OBSERVATION_SHAPE_MISMATCH")
+              media_sha = observation.get("mediaSHA256")
+              require(media_sha in expected_dates, "METADATA_FIXTURE_SHA_MISMATCH")
+              expected_date, _ = expected_dates[media_sha]
+              require(observation.get("expectedSourceDate") == expected_date
+                      and type(observation.get("exifImageWidth")) is int and observation["exifImageWidth"] == 320
+                      and type(observation.get("exifImageHeight")) is int and observation["exifImageHeight"] == 200,
+                      "METADATA_FIXTURE_OBSERVATION_MISMATCH")
+              expected_utc = parse_utc(expected_date)
+              require(parse_utc(observation.get("fileCreatedAt", "")) == expected_utc
+                      and parse_utc(observation.get("dateTimeOriginal", "")) == expected_utc,
+                      "POST_WORKER_DATE_MISMATCH")
+              require(isinstance(observation.get("assetId"), str)
+                      and re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", observation["assetId"]),
+                      "METADATA_ASSET_ID_INVALID")
+              observed_counts[media_sha] += 1
+              ids_by_sha.setdefault(media_sha, set()).add(observation["assetId"])
+              seen_assets.setdefault(observation["assetId"], set()).add(media_sha)
+          require(observed_counts == collections.Counter({sha: count for sha, (_, count) in expected_dates.items()}),
+                  "METADATA_FIXTURE_INVENTORY_MISMATCH")
+          require(all(len(ids) == 1 for ids in ids_by_sha.values()) and len(seen_assets) == 5,
+                  "METADATA_ASSET_IDENTITY_MISMATCH")
+          exif_journal = json.loads((report_path.parent / "exif-import.json").read_text(encoding="utf-8"))
+          exif_report = exif_journal.get("report", {})
+          require(exif_report.get("dateTransferPolicy") == "takeout-date-authoritative-generated-xmp-v1"
+                  and exif_report.get("contents", [{}])[0].get("sha256")
+                      == "26875c6fd8f73fffc3cc259086fa808ec22003ee20d5e69e9df1335a0d0ba058",
+                  "EXIF_SOURCE_DATE_POLICY_MISMATCH")
+          print(json.dumps({"status": report["status"], "scope": report["scope"], "checks": len(checks),
+                            "commands": len(commands), "metadataObservations": len(observations), "qualification": False}))
+          '
+
+      - name: Record real Immich integration not run on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $code = @'
+          import json
+          from pathlib import Path
+          record = {
+              "schemaVersion": 1,
+              "status": "not_run",
+              "qualification": False,
+              "scope": "not-run-on-windows-github-runner",
+              "platform": "Windows",
+              "reason": "LINUX_DOCKER_INTEGRATION_IS_NOT_AVAILABLE_ON_THIS_RUNNER",
+              "checks": [],
+              "cleanup": "not_started",
+          }
+          for name in ("immich source integration", "immich package integration"):
+              directory = Path("artifacts") / name
+              directory.mkdir(parents=True, exist_ok=True)
+              (directory / "integration-report.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+          print("Recorded source and package real-server checks as not_run on Windows.")
+          '@
+          python -B scripts/ci-test-report.py `
+            --report artifacts/immich-windows-not-run-command.json `
+            --stdout-log artifacts/immich-windows-not-run.stdout.log `
+            --stderr-log artifacts/immich-windows-not-run.stderr.log `
+            -- python -B -c $code
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Download and verify the published MVP compatibility package (Windows)
         if: runner.os == 'Windows'
@@ -311,12 +557,15 @@ jobs:
           Invoke-WebRequest -Uri "$base/SHA256SUMS.txt" -OutFile $checksums
           $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($actual -ne '${{ matrix.legacy_sha256 }}') { throw 'Published MVP ZIP does not match the pinned release SHA-256.' }
+          $checksumsHash = (Get-FileHash -LiteralPath $checksums -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($checksumsHash -ne '${{ matrix.legacy_sums_sha256 }}') { throw 'Published MVP SHA256SUMS.txt does not match its pinned release SHA-256.' }
           $expectedLine = "${{ matrix.legacy_sha256 }}  $name"
           $matching = @(Get-Content -LiteralPath $checksums | Where-Object { $_.TrimEnd("`r") -ceq $expectedLine })
           if ($matching.Count -ne 1) { throw 'Published SHA256SUMS.txt does not bind the pinned MVP ZIP exactly once.' }
           $unpacked = Join-Path $directory 'unpacked'
           New-Item -ItemType Directory -Path $unpacked | Out-Null
           Expand-Archive -LiteralPath $archive -DestinationPath $unpacked
+
 
       - name: Download and verify the published MVP compatibility package (Linux)
         if: runner.os == 'Linux'
@@ -330,8 +579,109 @@ jobs:
           curl --proto '=https' --tlsv1.2 --fail --location --retry 3 "$base/$name" -o "$directory/$name"
           curl --proto '=https' --tlsv1.2 --fail --location --retry 3 "$base/SHA256SUMS.txt" -o "$directory/published-SHA256SUMS.txt"
           printf '%s  %s\n' '${{ matrix.legacy_sha256 }}' "$directory/$name" | sha256sum --check --status
+          printf '%s  %s\n' '${{ matrix.legacy_sums_sha256 }}' "$directory/published-SHA256SUMS.txt" | sha256sum --check --status
           grep -Fx -- '${{ matrix.legacy_sha256 }}  ${{ matrix.legacy_package }}' "$directory/published-SHA256SUMS.txt"
           tar -xzf "$directory/$name" -C "$directory/unpacked"
+
+
+      - name: Download and verify published beta compatibility package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = @'
+          $ErrorActionPreference = 'Stop'
+          $directory = Join-Path $env:RUNNER_TEMP 'archivebridge-beta-0.2.0'
+          $unpacked = Join-Path $directory 'unpacked'
+          New-Item -ItemType Directory -Path $unpacked | Out-Null
+          $name = '${{ matrix.beta_package }}'
+          $base = 'https://github.com/Pastalikek65/archivebridge/releases/download/v0.2.0'
+          $archive = Join-Path $directory $name
+          $checksums = Join-Path $directory 'published-SHA256SUMS.txt'
+          Invoke-WebRequest -Uri "$base/$name" -OutFile $archive
+          Invoke-WebRequest -Uri "$base/SHA256SUMS.txt" -OutFile $checksums
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne '${{ matrix.beta_sha256 }}') { throw 'Published beta package SHA-256 mismatch.' }
+          if ((Get-FileHash -LiteralPath $checksums -Algorithm SHA256).Hash.ToLowerInvariant() -ne '${{ matrix.beta_sums_sha256 }}') { throw 'Published beta checksum-file SHA-256 mismatch.' }
+          $line = "${{ matrix.beta_sha256 }}  $name"
+          $matches = @(Get-Content -LiteralPath $checksums | Where-Object { $_.TrimEnd("`r") -ceq $line })
+          if ($matches.Count -ne 1) { throw 'Published beta checksum file does not bind the package exactly once.' }
+          Expand-Archive -LiteralPath $archive -DestinationPath $unpacked
+          Write-Output "Verified and extracted $name"
+          '@
+          python -B scripts/ci-test-report.py `
+            --report artifacts/beta-package-download-report.json `
+            --stdout-log artifacts/beta-package-download.stdout.log `
+            --stderr-log artifacts/beta-package-download.stderr.log `
+            -- pwsh -NoLogo -NoProfile -Command $script
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Download and verify published beta compatibility package (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -B scripts/ci-test-report.py \
+            --report artifacts/beta-package-download-report.json \
+            --stdout-log artifacts/beta-package-download.stdout.log \
+            --stderr-log artifacts/beta-package-download.stderr.log \
+            -- bash -e -u -o pipefail -c '
+              directory="$RUNNER_TEMP/archivebridge-beta-0.2.0"
+              mkdir -p "$directory/unpacked"
+              name="${{ matrix.beta_package }}"
+              base="https://github.com/Pastalikek65/archivebridge/releases/download/v0.2.0"
+              curl --proto "=https" --tlsv1.2 --fail --location --retry 3 "$base/$name" -o "$directory/$name"
+              curl --proto "=https" --tlsv1.2 --fail --location --retry 3 "$base/SHA256SUMS.txt" -o "$directory/published-SHA256SUMS.txt"
+              printf "%s  %s\\n" "${{ matrix.beta_sha256 }}" "$directory/$name" | sha256sum --check --status
+              printf "%s  %s\\n" "${{ matrix.beta_sums_sha256 }}" "$directory/published-SHA256SUMS.txt" | sha256sum --check --status
+              grep -Fx -- "${{ matrix.beta_sha256 }}  ${{ matrix.beta_package }}" "$directory/published-SHA256SUMS.txt"
+              tar -xzf "$directory/$name" -C "$directory/unpacked"
+              echo "Verified and extracted $name"
+            '
+
+      - name: Run source v1 compatibility against actual published 0.1 and 0.2 packages (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $mvp = Join-Path $env:RUNNER_TEMP 'archivebridge-mvp-0.1.0'
+          $beta = Join-Path $env:RUNNER_TEMP 'archivebridge-beta-0.2.0'
+          python -B scripts/ci-test-report.py `
+            --report artifacts/v1-source-compatibility-command.json `
+            --stdout-log artifacts/v1-source-compatibility.stdout.log `
+            --stderr-log artifacts/v1-source-compatibility.stderr.log `
+            -- python -B scripts/v1-compatibility.py `
+              --current-binary '${{ matrix.binary }}' `
+              --expected-version 1.0.0 `
+              --expected-commit $env:GITHUB_SHA `
+              --mvp-package (Join-Path $mvp '${{ matrix.legacy_package }}') `
+              --mvp-sums (Join-Path $mvp 'published-SHA256SUMS.txt') `
+              --beta-package (Join-Path $beta '${{ matrix.beta_package }}') `
+              --beta-sums (Join-Path $beta 'published-SHA256SUMS.txt') `
+              --fixtures-dir examples/sample `
+              --out 'artifacts/source compatibility'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run source v1 compatibility against actual published 0.1 and 0.2 packages (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mvp="$RUNNER_TEMP/archivebridge-mvp-0.1.0"
+          beta="$RUNNER_TEMP/archivebridge-beta-0.2.0"
+          python -B scripts/ci-test-report.py \
+            --report artifacts/v1-source-compatibility-command.json \
+            --stdout-log artifacts/v1-source-compatibility.stdout.log \
+            --stderr-log artifacts/v1-source-compatibility.stderr.log \
+            -- python -B scripts/v1-compatibility.py \
+              --current-binary '${{ matrix.binary }}' \
+              --expected-version 1.0.0 \
+              --expected-commit "$GITHUB_SHA" \
+              --mvp-package "$mvp/${{ matrix.legacy_package }}" \
+              --mvp-sums "$mvp/published-SHA256SUMS.txt" \
+              --beta-package "$beta/${{ matrix.beta_package }}" \
+              --beta-sums "$beta/published-SHA256SUMS.txt" \
+              --fixtures-dir examples/sample \
+              --out 'artifacts/source compatibility'
 
       - name: Run beta compare, forced-recovery, and published-MVP compatibility acceptance (Windows)
         if: runner.os == 'Windows'
@@ -348,7 +698,7 @@ jobs:
             --stderr-log artifacts/beta-acceptance.stderr.log `
             -- python -B scripts/beta-acceptance.py `
               --binary '${{ matrix.binary }}' `
-              --expected-version 0.2.0 `
+              --expected-version 1.0.0 `
               --expected-commit $env:GITHUB_SHA `
               --fixtures-dir examples/sample `
               --out 'artifacts/beta acceptance' `
@@ -370,7 +720,7 @@ jobs:
             --stderr-log artifacts/beta-acceptance.stderr.log \
             -- python -B scripts/beta-acceptance.py \
               --binary '${{ matrix.binary }}' \
-              --expected-version 0.2.0 \
+              --expected-version 1.0.0 \
               --expected-commit "$GITHUB_SHA" \
               --fixtures-dir examples/sample \
               --out 'artifacts/beta acceptance' \
@@ -389,7 +739,7 @@ jobs:
             --stderr-log artifacts/package.stderr.log \
             -- python -B scripts/package.py \
               --binary "${{ matrix.binary }}" \
-              --version 0.2.0 \
+              --version 1.0.0 \
               --source-commit "$GITHUB_SHA" \
               --platform "${{ matrix.platform }}" \
               --out release
@@ -420,7 +770,7 @@ jobs:
           Push-Location $away
           python -B $reporter --report $report --stdout-log $stdout --stderr-log $stderr -- python -B $acceptance `
             --binary (Join-Path $packageRoot 'archivebridge.exe') `
-            --expected-version 0.2.0 `
+            --expected-version 1.0.0 `
             --expected-commit $env:GITHUB_SHA `
             --fixtures-dir $fixtures `
             --out (Join-Path $repo 'artifacts\package acceptance') `
@@ -429,7 +779,6 @@ jobs:
           $code = $LASTEXITCODE
           Pop-Location
           if ($code -ne 0) { exit $code }
-
           $legacyDirectory = Join-Path $env:RUNNER_TEMP 'archivebridge-mvp-0.1.0'
           $legacyArchive = Join-Path $legacyDirectory '${{ matrix.legacy_package }}'
           $legacyChecksums = Join-Path $legacyDirectory 'published-SHA256SUMS.txt'
@@ -444,7 +793,7 @@ jobs:
           Push-Location $away
           python -B $reporter --report $betaReport --stdout-log $betaStdout --stderr-log $betaStderr -- python -B $betaAcceptance `
             --binary $betaBinary `
-            --expected-version 0.2.0 `
+            --expected-version 1.0.0 `
             --expected-commit $env:GITHUB_SHA `
             --fixtures-dir $fixtures `
             --out (Join-Path $repo 'artifacts\package beta acceptance') `
@@ -456,6 +805,36 @@ jobs:
             --beta-package-root $packageRoot `
             --beta-package-sha256 $betaHash `
             --beta-published-checksum $betaChecksums
+          $code = $LASTEXITCODE
+          Pop-Location
+          if ($code -ne 0) { exit $code }
+
+      - name: Run package v1 compatibility against actual published 0.1 and 0.2 packages (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repo = $env:GITHUB_WORKSPACE
+          $install = Join-Path $env:RUNNER_TEMP 'ArchiveBridge package acceptance with spaces'
+          $packageRoot = Join-Path (Join-Path $install 'unpacked package with spaces') '${{ matrix.package_root }}'
+          $away = Join-Path $env:RUNNER_TEMP 'working directory away from checkout'
+          $mvp = Join-Path $env:RUNNER_TEMP 'archivebridge-mvp-0.1.0'
+          $beta = Join-Path $env:RUNNER_TEMP 'archivebridge-beta-0.2.0'
+          Push-Location $away
+          python -B (Join-Path $repo 'scripts\ci-test-report.py') `
+            --report (Join-Path $repo 'artifacts\v1-package-compatibility-command.json') `
+            --stdout-log (Join-Path $repo 'artifacts\v1-package-compatibility.stdout.log') `
+            --stderr-log (Join-Path $repo 'artifacts\v1-package-compatibility.stderr.log') `
+            -- python -B (Join-Path $repo 'scripts\v1-compatibility.py') `
+              --current-binary (Join-Path $packageRoot 'archivebridge.exe') `
+              --expected-version 1.0.0 `
+              --expected-commit $env:GITHUB_SHA `
+              --mvp-package (Join-Path $mvp '${{ matrix.legacy_package }}') `
+              --mvp-sums (Join-Path $mvp 'published-SHA256SUMS.txt') `
+              --beta-package (Join-Path $beta '${{ matrix.beta_package }}') `
+              --beta-sums (Join-Path $beta 'published-SHA256SUMS.txt') `
+              --fixtures-dir (Join-Path $repo 'examples\sample') `
+              --out (Join-Path $repo 'artifacts\package compatibility')
           $code = $LASTEXITCODE
           Pop-Location
           if ($code -ne 0) { exit $code }
@@ -481,7 +860,7 @@ jobs:
             --stderr-log "$GITHUB_WORKSPACE/artifacts/package-acceptance.stderr.log" \
             -- python -B "$GITHUB_WORKSPACE/scripts/acceptance.py" \
               --binary "$package_root/archivebridge" \
-              --expected-version 0.2.0 \
+              --expected-version 1.0.0 \
               --expected-commit "$GITHUB_SHA" \
               --fixtures-dir "$GITHUB_WORKSPACE/examples/sample" \
               --out "$GITHUB_WORKSPACE/artifacts/package acceptance" \
@@ -501,7 +880,7 @@ jobs:
             --stderr-log "$GITHUB_WORKSPACE/artifacts/package-beta-acceptance.stderr.log" \
             -- python -B "$GITHUB_WORKSPACE/scripts/beta-acceptance.py" \
               --binary "$beta_binary" \
-              --expected-version 0.2.0 \
+              --expected-version 1.0.0 \
               --expected-commit "$GITHUB_SHA" \
               --fixtures-dir "$GITHUB_WORKSPACE/examples/sample" \
               --out "$GITHUB_WORKSPACE/artifacts/package beta acceptance" \
@@ -513,6 +892,222 @@ jobs:
               --beta-package-root "$package_root" \
               --beta-package-sha256 "$beta_hash" \
               --beta-published-checksum "$beta_checksums"
+
+      - name: Run package v1 compatibility against actual published 0.1 and 0.2 packages (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          install="$RUNNER_TEMP/ArchiveBridge package acceptance with spaces"
+          package_root="$install/unpacked package with spaces/${{ matrix.package_root }}"
+          away="$RUNNER_TEMP/working directory away from checkout"
+          mvp="$RUNNER_TEMP/archivebridge-mvp-0.1.0"
+          beta="$RUNNER_TEMP/archivebridge-beta-0.2.0"
+          cd "$away"
+          python -B "$GITHUB_WORKSPACE/scripts/ci-test-report.py" \
+            --report "$GITHUB_WORKSPACE/artifacts/v1-package-compatibility-command.json" \
+            --stdout-log "$GITHUB_WORKSPACE/artifacts/v1-package-compatibility.stdout.log" \
+            --stderr-log "$GITHUB_WORKSPACE/artifacts/v1-package-compatibility.stderr.log" \
+            -- python -B "$GITHUB_WORKSPACE/scripts/v1-compatibility.py" \
+              --current-binary "$package_root/archivebridge" \
+              --expected-version 1.0.0 \
+              --expected-commit "$GITHUB_SHA" \
+              --mvp-package "$mvp/${{ matrix.legacy_package }}" \
+              --mvp-sums "$mvp/published-SHA256SUMS.txt" \
+              --beta-package "$beta/${{ matrix.beta_package }}" \
+              --beta-sums "$beta/published-SHA256SUMS.txt" \
+              --fixtures-dir "$GITHUB_WORKSPACE/examples/sample" \
+              --out "$GITHUB_WORKSPACE/artifacts/package compatibility"
+
+      - name: Run real Immich integration against extracted package binary (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          install="$RUNNER_TEMP/ArchiveBridge package acceptance with spaces"
+          package_root="$install/unpacked package with spaces/${{ matrix.package_root }}"
+          python -B "$GITHUB_WORKSPACE/scripts/ci-test-report.py" \
+            --report "$GITHUB_WORKSPACE/artifacts/immich-package-integration-command.json" \
+            --stdout-log "$GITHUB_WORKSPACE/artifacts/immich-package-integration.stdout.log" \
+            --stderr-log "$GITHUB_WORKSPACE/artifacts/immich-package-integration.stderr.log" \
+            -- python -B "$GITHUB_WORKSPACE/scripts/immich-integration.py" \
+              --binary "$package_root/archivebridge" \
+              --expected-version 1.0.0 \
+              --expected-commit "$GITHUB_SHA" \
+              --out "$GITHUB_WORKSPACE/artifacts/immich package integration"
+          python -B "$GITHUB_WORKSPACE/scripts/ci-test-report.py" \
+            --report "$GITHUB_WORKSPACE/artifacts/immich-package-integration-validation-command.json" \
+            --stdout-log "$GITHUB_WORKSPACE/artifacts/immich-package-integration-validation.stdout.log" \
+            --stderr-log "$GITHUB_WORKSPACE/artifacts/immich-package-integration-validation.stderr.log" \
+            -- python -B -c '
+          import json
+          import collections, datetime as dt, hashlib, os, re
+          from pathlib import Path
+          report_path = Path(os.environ["GITHUB_WORKSPACE"]) / "artifacts" / "immich package integration" / "integration-report.json"
+          report = json.loads(report_path.read_text(encoding="utf-8"))
+          checks = report.get("checks")
+          binary = report.get("binary", {})
+          expected_checks = [
+              "pinned_images", "loopback_only", "exact_server_version", "synthetic_account", "seven_scoped_key",
+              "offline_unicode_preview", "remote_original_sha256", "source_date", "unicode_filename",
+              "duplicate_content_multi_album", "readonly_remote_verification", "repeat_no_extra_resources",
+              "seven_scope_preflight", "same_account_key_rotation_resume", "different_account_resume_refused",
+              "source_dates_after_real_metadata_workers", "ambiguous_default_blocked_before_writes",
+              "explicit_skips_and_excluded_relationships", "raw_sidecars_not_transferred",
+              "skip_aware_readonly_verification", "skip_aware_resume", "accepted_upload_response_interruption",
+              "durable_in_flight_journal", "explicit_resume_reconciles_full_sha256", "no_blind_upload_retry",
+              "prior_resume_report_preserved", "takeout_date_survives_conflicting_embedded_exif_after_workers",
+          ]
+          def require(value, message):
+              if not value:
+                  raise SystemExit(message)
+          assert report.get("status") == "passed" and report.get("scope") == "native-real-immich-synthetic"
+          assert report.get("qualification") is False and report.get("cleanup") == "passed"
+          assert report.get("platform") == "Linux" and checks == expected_checks and len(set(checks)) == 27
+          assert report.get("synthetic") is True and report.get("serverVersion") == "3.3.1"
+          assert report.get("workers") == {"api": True, "microservices": True, "machineLearning": False}
+          assert binary.get("version") == "1.0.0" and binary.get("commit") == os.environ["GITHUB_SHA"]
+          helper_path = Path(os.environ["GITHUB_WORKSPACE"]) / "scripts" / "immich-integration.py"
+          helper_bytes = helper_path.read_bytes()
+          helper = report.get("harness", {})
+          require(helper == {"name": "immich-integration.py", "bytes": len(helper_bytes),
+                             "sha256": hashlib.sha256(helper_bytes).hexdigest()}, "PACKAGE_HELPER_IDENTITY_MISMATCH")
+          binary_path = (Path(os.environ["RUNNER_TEMP"]) / "ArchiveBridge package acceptance with spaces" /
+                         "unpacked package with spaces" / "archivebridge-1.0.0-linux-x64" / "archivebridge").resolve(strict=True)
+          binary_bytes = binary_path.read_bytes()
+          require(type(binary.get("bytes")) is int and binary["bytes"] == len(binary_bytes)
+                  and binary.get("sha256") == hashlib.sha256(binary_bytes).hexdigest(), "PACKAGE_BINARY_IDENTITY_MISMATCH")
+          commands = report.get("commands")
+          command_names = ["version", "plan", "export", "immich", "immich", "immich", "immich", "plan", "export",
+                           "immich", "immich", "immich", "plan", "export", "immich", "immich", "immich", "immich",
+                           "immich", "plan", "export", "immich", "immich", "immich", "plan", "export", "immich",
+                           "immich", "immich"]
+          require(isinstance(commands, list) and len(commands) == 29, "PACKAGE_NATIVE_COMMAND_COUNT_MISMATCH")
+          for index, (command, expected_name) in enumerate(zip(commands, command_names), 1):
+              args = command.get("arguments")
+              require(type(command.get("number")) is int and command["number"] == index
+                      and isinstance(args, list) and args and args[0] == expected_name
+                      and type(command.get("exitCode")) is int, "PACKAGE_NATIVE_COMMAND_INVENTORY_MISMATCH")
+              expected_failure = index in {10, 12, 15, 16, 22}
+              require((command["exitCode"] != 0) == expected_failure, "PACKAGE_NATIVE_COMMAND_RESULT_MISMATCH")
+          require(commands[21].get("termination") == "forced-owned-child-after-server-accepted-upload"
+                  and type(commands[21].get("pid")) is int and commands[21]["pid"] > 0,
+                  "PACKAGE_FORCED_INTERRUPTION_EVIDENCE_MISSING")
+          expected_dates = {
+              "83807b4ef61c1d03497a389abee15f67f36fbc10506f767fdd69c1a044594153": ("2023-11-14T22:13:20Z", 2),
+              "f9454317f83e5d8ab90431433bbe6a345f69f5d213138756db22e825168d034c": ("2023-11-15T22:13:20Z", 1),
+              "932e3e709ffde373c75b1d6724b5d005aea9d5736c1bd119be867014a88f511c": ("2023-11-14T22:13:20Z", 1),
+              "e898e7ad061e3e93536b44daba1ee0a5d1b548a42d3fe32f817978257f711109": ("2023-11-14T22:13:19Z", 1),
+              "26875c6fd8f73fffc3cc259086fa808ec22003ee20d5e69e9df1335a0d0ba058": ("2023-11-14T22:13:20Z", 1),
+          }
+          observations = report.get("metadataObservations")
+          require(isinstance(observations, list) and len(observations) == 6, "PACKAGE_METADATA_OBSERVATION_COUNT_MISMATCH")
+          observed_counts, ids_by_sha, seen_assets = collections.Counter(), {}, {}
+          expected_fields = {"assetId", "mediaSHA256", "expectedSourceDate", "fileCreatedAt", "exifImageWidth",
+                             "exifImageHeight", "dateTimeOriginal"}
+          def parse_utc(value):
+              parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+              require(parsed.tzinfo is not None, "PACKAGE_METADATA_TIMESTAMP_MISSING_TIMEZONE")
+              return parsed.astimezone(dt.timezone.utc)
+          for observation in observations:
+              require(isinstance(observation, dict) and set(observation) == expected_fields,
+                      "PACKAGE_METADATA_OBSERVATION_SHAPE_MISMATCH")
+              media_sha = observation.get("mediaSHA256")
+              require(media_sha in expected_dates, "PACKAGE_METADATA_FIXTURE_SHA_MISMATCH")
+              expected_date, _ = expected_dates[media_sha]
+              require(observation.get("expectedSourceDate") == expected_date
+                      and type(observation.get("exifImageWidth")) is int and observation["exifImageWidth"] == 320
+                      and type(observation.get("exifImageHeight")) is int and observation["exifImageHeight"] == 200,
+                      "PACKAGE_METADATA_FIXTURE_OBSERVATION_MISMATCH")
+              expected_utc = parse_utc(expected_date)
+              require(parse_utc(observation.get("fileCreatedAt", "")) == expected_utc
+                      and parse_utc(observation.get("dateTimeOriginal", "")) == expected_utc,
+                      "PACKAGE_POST_WORKER_DATE_MISMATCH")
+              require(isinstance(observation.get("assetId"), str)
+                      and re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", observation["assetId"]),
+                      "PACKAGE_METADATA_ASSET_ID_INVALID")
+              observed_counts[media_sha] += 1
+              ids_by_sha.setdefault(media_sha, set()).add(observation["assetId"])
+              seen_assets.setdefault(observation["assetId"], set()).add(media_sha)
+          require(observed_counts == collections.Counter({sha: count for sha, (_, count) in expected_dates.items()}),
+                  "PACKAGE_METADATA_FIXTURE_INVENTORY_MISMATCH")
+          require(all(len(ids) == 1 for ids in ids_by_sha.values()) and len(seen_assets) == 5,
+                  "PACKAGE_METADATA_ASSET_IDENTITY_MISMATCH")
+          exif_journal = json.loads((report_path.parent / "exif-import.json").read_text(encoding="utf-8"))
+          exif_report = exif_journal.get("report", {})
+          require(exif_report.get("dateTransferPolicy") == "takeout-date-authoritative-generated-xmp-v1"
+                  and exif_report.get("contents", [{}])[0].get("sha256")
+                      == "26875c6fd8f73fffc3cc259086fa808ec22003ee20d5e69e9df1335a0d0ba058",
+                  "PACKAGE_EXIF_SOURCE_DATE_POLICY_MISMATCH")
+          print(json.dumps({"status": report["status"], "scope": report["scope"], "checks": len(checks),
+                            "commands": len(commands), "metadataObservations": len(observations), "qualification": False}))
+          '
+
+      - name: Retain verified published compatibility inputs
+        shell: bash
+        env:
+          MVP_PACKAGE_NAME: ${{ matrix.legacy_package }}
+          MVP_PACKAGE_SHA256: ${{ matrix.legacy_sha256 }}
+          MVP_SUMS_SHA256: ${{ matrix.legacy_sums_sha256 }}
+          BETA_PACKAGE_NAME: ${{ matrix.beta_package }}
+          BETA_PACKAGE_SHA256: ${{ matrix.beta_sha256 }}
+          BETA_SUMS_SHA256: ${{ matrix.beta_sums_sha256 }}
+        run: |
+          set -euo pipefail
+          python -B scripts/ci-test-report.py \
+            --report artifacts/published-input-retention-command.json \
+            --stdout-log artifacts/published-input-retention.stdout.log \
+            --stderr-log artifacts/published-input-retention.stderr.log \
+            -- python -B -c '
+          import hashlib, json, os, re, stat
+          from pathlib import Path
+          def bounded_digest(path):
+              info = path.lstat()
+              limit = 64 * 1024 * 1024
+              if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= limit:
+                  raise SystemExit("PUBLISHED_INPUT_FILE_INVALID")
+              digest = hashlib.sha256()
+              count = 0
+              with path.open("rb") as stream:
+                  while True:
+                      chunk = stream.read(min(1024 * 1024, limit - count + 1))
+                      if not chunk:
+                          break
+                      count += len(chunk)
+                      if count > limit:
+                          raise SystemExit("PUBLISHED_INPUT_FILE_INVALID")
+                      digest.update(chunk)
+              if count != info.st_size:
+                  raise SystemExit("PUBLISHED_INPUT_IDENTITY_MISMATCH")
+              return count, digest.hexdigest()
+          destination = Path("artifacts/published compatibility inputs")
+          destination.mkdir(exist_ok=False)
+          retained = []
+          for label, version in (("mvp", "0.1.0"), ("beta", "0.2.0")):
+              prefix = label.upper()
+              name = os.environ[prefix + "_PACKAGE_NAME"]
+              if Path(name).name != name or "/" in name or "\\" in name:
+                  raise SystemExit("PUBLISHED_INPUT_NAME_INVALID")
+              source = Path(os.environ["RUNNER_TEMP"]) / ("archivebridge-" + label + "-" + version)
+              target = destination / label
+              target.mkdir(exist_ok=False)
+              for filename, pin in ((name, os.environ[prefix + "_PACKAGE_SHA256"]),
+                                    ("published-SHA256SUMS.txt", os.environ[prefix + "_SUMS_SHA256"])):
+                  path = source / filename
+                  info = path.lstat()
+                  if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= 64 * 1024 * 1024:
+                      raise SystemExit("PUBLISHED_INPUT_FILE_INVALID")
+                  with path.open("rb") as stream:
+                      raw = stream.read(64 * 1024 * 1024 + 1)
+                  if not re.fullmatch("[0-9a-f]{64}", pin) or len(raw) != info.st_size or hashlib.sha256(raw).hexdigest() != pin:
+                      raise SystemExit("PUBLISHED_INPUT_IDENTITY_MISMATCH")
+                  with (target / filename).open("xb") as output:
+                      output.write(raw)
+                  if bounded_digest(target / filename) != (len(raw), pin) or bounded_digest(path) != (len(raw), pin):
+                      raise SystemExit("PUBLISHED_INPUT_COPY_MISMATCH")
+                  retained.append({"version": version, "name": filename, "bytes": len(raw), "sha256": pin})
+          print(json.dumps({"status": "passed", "retained": retained}))
+          '
 
       - uses: actions/upload-artifact@v7.0.2
         if: always()
