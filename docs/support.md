@@ -1,0 +1,13 @@
+# Supported inputs and limits
+
+Initial targets are Windows 11 x64 and Ubuntu 24.04 x64, with filesystems supporting hard links (such as NTFS and ext4). Qualification is reported per release; source builds do not inherit a release's platform evidence. Packages are unsigned. A current Chromium browser is the viewer qualification target.
+
+Source parts can be ZIP, `.tar.gz` or `.tgz`. Supported media extensions include common JPEG/PNG/GIF/WebP/HEIC/TIFF/AVIF images, camera raw files and MP4/MOV/MKV/WebM/AVI and other documented video extensions. Preservation is byte copying, not decoding or format conversion. The viewer previews JPEG/PNG only; other supported media can be downloaded. Preview headers must fit within 1 MiB, dimensions within 32,768 pixels per side and 64 million pixels overall. A rejected preview does not change its stored original.
+
+The core accepts at most 16 parts, 100,000 entries across all parts (including directories), 32 GiB per supported media member and 1 TiB of expanded regular-member payload by default. ZIP central-directory metadata is checked before the standard reader allocates member records: each directory is limited to 64 MiB, each member name to 1,024 UTF-8 bytes, and combined member paths to 16 MiB per ZIP. ZIP64 is supported; spanned and self-extracting archives are rejected. JSON interpretation is limited to 1 MiB per sidecar; larger raw sidecars remain preserved with a visible issue. Expanded payload includes unsupported members; TAR framing, padding and trailers have a separate finite work allowance. These work bounds are not a process-memory guarantee.
+
+Metadata matching requires exact supported same-folder names or a unique matching `title`. Ambiguous matches are preserved unattached. Year collections named `Photos from YYYY` are not treated as user albums. Other source folder names can represent album relationships; naming variants and localized structures need explicit review. A JSON sidecar with a supported timestamp supplies a separate UTC manifest date. Missing/invalid dates remain unresolved; no date is guessed from download time.
+
+Malformed ZIP CRC/gzip, duplicate or case-colliding paths, traversal, backslashes, symbolic links and nonregular source members are rejected. Trusted local path ancestors are required. This tool is not a security sandbox for a hostile concurrent filesystem.
+
+Unknown members are listed as unsupported and are not exported as media. Embedded metadata, which remains in original bytes, is not semantically interpreted. The app does not prove account completeness, repair damaged media, decrypt encrypted ZIPs or automatically transfer to another service. The planned Immich adapter will be an explicit separate action.

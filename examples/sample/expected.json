@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "synthetic": true,
+  "mediaOccurrences": 6,
+  "uniqueMediaContent": 4,
+  "sidecarOccurrences": 7,
+  "albums": [
+    "Ambiguous",
+    "Family",
+    "Weekend"
+  ],
+  "ambiguousFile": "Takeout/Google Photos/Ambiguous/collision.png",
+  "sourceArchives": [
+    {
+      "name": "takeout-part-1.zip",
+      "bytes": 4018,
+      "sha256": "e08bcc112a57dcc083b2418b0084c950162c2e384b47a23bcb69e0b89f9f2308"
+    },
+    {
+      "name": "takeout-part-2.zip",
+      "bytes": 4434,
+      "sha256": "4fe15a350eddc52ea5812ec1217587c1a2cb431116b31552456b8770fe65631d"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+/.control/
+/artifacts/
+/release/
+/bin/
+/coverage.out
+*.exe
+**/node_modules/
+!examples/sample/*.zip
+**/__pycache__/
+*.pyc

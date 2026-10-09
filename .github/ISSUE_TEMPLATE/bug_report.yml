@@ -1,0 +1,17 @@
+name: Bug report
+description: Report a reproducible problem using synthetic data.
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Include version, OS, command and expected behavior. Do not include personal exports, plans or credentials.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Synthetic reproduction
+      description: Minimal steps or a small example without private information.
+    validations:
+      required: true

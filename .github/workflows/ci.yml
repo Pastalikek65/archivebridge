@@ -1,0 +1,315 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Native verification (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+            binary: bin/archivebridge.exe
+            package: archivebridge-0.1.0-win-x64.zip
+            package_root: archivebridge-0.1.0-win-x64
+          - os: ubuntu-latest
+            platform: linux
+            binary: bin/archivebridge
+            package: archivebridge-0.1.0-linux-x64.tar.gz
+            package_root: archivebridge-0.1.0-linux-x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      NODE_USE_SYSTEM_CA: '1'
+      npm_config_strict_ssl: 'true'
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version: '1.27.0'
+          cache: false
+
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: scripts/browser-tools/package-lock.json
+
+      - name: Record native runner and full source identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          python -B - <<'PY'
+          import json
+          import os
+          import platform
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          def command(*args):
+              return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT).strip()
+
+          npm_executable = "npm.cmd" if os.name == "nt" else "npm"
+          commit = command("git", "rev-parse", "HEAD").lower()
+          expected = os.environ["GITHUB_SHA"].lower()
+          if commit != expected or len(commit) != 40:
+              raise SystemExit("checked out Git identity is not the full GitHub source commit")
+          machine = platform.machine().lower()
+          if machine not in ("amd64", "x86_64") or platform.architecture()[0] != "64bit":
+              raise SystemExit(f"CI requires a native x64 runner, got {machine}")
+          report = {
+              "schemaVersion": 1,
+              "runnerOS": os.environ.get("RUNNER_OS", ""),
+              "platform": platform.platform(),
+              "machine": machine,
+              "architecture": platform.architecture()[0],
+              "python": sys.version,
+              "go": command("go", "version"),
+              "node": command("node", "--version"),
+              "npm": command(npm_executable, "--version"),
+              "npmStrictSSL": command(npm_executable, "config", "get", "strict-ssl"),
+              "nodeUsesSystemCA": os.environ.get("NODE_USE_SYSTEM_CA"),
+              "commit": commit,
+          }
+          Path("artifacts/runner-info.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+          print(json.dumps(report, indent=2))
+          PY
+
+      - name: Go unit and integration tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -B scripts/ci-test-report.py \
+            --report artifacts/go-test-report.json \
+            --stdout-log artifacts/go-test.jsonl \
+            --stderr-log artifacts/go-test.stderr.log \
+            -- go test -json -count=1 ./...
+
+      - name: Go static analysis
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -B scripts/ci-test-report.py \
+            --report artifacts/go-vet-report.json \
+            --stdout-log artifacts/go-vet.stdout.log \
+            --stderr-log artifacts/go-vet.stderr.log \
+            -- go vet ./...
+
+      - name: Release packager tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -B scripts/ci-test-report.py \
+            --report artifacts/package-tests-report.json \
+            --stdout-log artifacts/package-tests.stdout.log \
+            --stderr-log artifacts/package-tests.stderr.log \
+            -- python -B scripts/test_package.py
+
+      - name: Independent acceptance-harness regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -B scripts/ci-test-report.py \
+            --report artifacts/acceptance-tests-report.json \
+            --stdout-log artifacts/acceptance-tests.stdout.log \
+            --stderr-log artifacts/acceptance-tests.stderr.log \
+            -- python -B scripts/test_acceptance.py
+
+      - name: Install pinned browser verification dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm_cmd=npm
+          if [[ "$RUNNER_OS" == Windows ]]; then npm_cmd=npm.cmd; fi
+          python -B scripts/ci-test-report.py \
+            --report artifacts/npm-ci-report.json \
+            --stdout-log artifacts/npm-ci.stdout.log \
+            --stderr-log artifacts/npm-ci.stderr.log \
+            -- "$npm_cmd" ci --prefix scripts/browser-tools --strict-ssl=true
+
+      - name: Audit pinned browser verification dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm_cmd=npm
+          if [[ "$RUNNER_OS" == Windows ]]; then npm_cmd=npm.cmd; fi
+          python -B scripts/ci-test-report.py \
+            --report artifacts/npm-audit-report.json \
+            --stdout-log artifacts/npm-audit.json \
+            --stderr-log artifacts/npm-audit.stderr.log \
+            -- "$npm_cmd" audit --prefix scripts/browser-tools --json --audit-level=high --strict-ssl=true
+
+      - name: Install fresh Playwright Chromium and Linux dependencies
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          python -B scripts/ci-test-report.py \
+            --report artifacts/playwright-install-report.json \
+            --stdout-log artifacts/playwright-install.stdout.log \
+            --stderr-log artifacts/playwright-install.stderr.log \
+            -- node scripts/browser-tools/node_modules/playwright/cli.js install --with-deps chromium
+
+      - name: Load narrowly scoped Linux user-namespace profiles
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo timeout 5m apt-get update
+          sudo timeout 5m apt-get install -y --no-install-recommends apparmor
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
+          restriction=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [[ ! -r "$restriction" || "$(<"$restriction")" != 1 ]]; then
+            echo "Linux unprivileged-userns restriction must be enabled for sandboxed Chromium acceptance." >&2
+            exit 1
+          fi
+          profile_source=$(mktemp)
+          trap 'rm -f "$profile_source"' EXIT
+          cat >"$profile_source" <<EOF
+          abi <abi/4.0>,
+          include <tunables/global>
+          profile archivebridge-ci-chromium ${HOME}/.cache/ms-playwright/chromium-*/chrome-linux64/chrome flags=(unconfined) { userns, }
+          profile archivebridge-ci-headless ${HOME}/.cache/ms-playwright/chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell flags=(unconfined) { userns, }
+          EOF
+          sudo install -o root -g root -m 0644 "$profile_source" /etc/apparmor.d/archivebridge-ci
+          sudo apparmor_parser -r /etc/apparmor.d/archivebridge-ci
+          profiles=/sys/kernel/security/apparmor/profiles
+          for name in archivebridge-ci-chromium archivebridge-ci-headless; do
+            if ! sudo grep -Fq "$name" "$profiles"; then
+              echo "AppArmor did not load the expected profile: $name" >&2
+              exit 1
+            fi
+          done
+
+      - name: Build native release binary with source identity
+        shell: bash
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          set -euo pipefail
+          mkdir -p bin
+          python -B scripts/ci-test-report.py \
+            --report artifacts/go-build-report.json \
+            --stdout-log artifacts/go-build.stdout.log \
+            --stderr-log artifacts/go-build.stderr.log \
+            -- go build -buildvcs=true -trimpath \
+              -ldflags "-X main.version=0.1.0 -X main.commit=${GITHUB_SHA}" \
+              -o "${{ matrix.binary }}" ./cmd/archivebridge
+
+      - name: Run source acceptance against fixtures and browser
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -B scripts/ci-test-report.py \
+            --report artifacts/source-acceptance-command.json \
+            --stdout-log artifacts/source-acceptance.stdout.log \
+            --stderr-log artifacts/source-acceptance.stderr.log \
+            -- python -B scripts/acceptance.py \
+              --binary "${{ matrix.binary }}" \
+              --expected-version 0.1.0 \
+              --expected-commit "$GITHUB_SHA" \
+              --fixtures-dir examples/sample \
+              --out "artifacts/source acceptance"
+
+      - name: Create native package in a fresh release directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -B scripts/ci-test-report.py \
+            --report artifacts/package-command.json \
+            --stdout-log artifacts/package.stdout.log \
+            --stderr-log artifacts/package.stderr.log \
+            -- python -B scripts/package.py \
+              --binary "${{ matrix.binary }}" \
+              --version 0.1.0 \
+              --source-commit "$GITHUB_SHA" \
+              --platform "${{ matrix.platform }}" \
+              --out release
+
+      - name: Accept extracted package away from checkout on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repo = $env:GITHUB_WORKSPACE
+          $install = Join-Path $env:RUNNER_TEMP 'ArchiveBridge package acceptance with spaces'
+          $unpacked = Join-Path $install 'unpacked package with spaces'
+          $away = Join-Path $env:RUNNER_TEMP 'working directory away from checkout'
+          New-Item -ItemType Directory -Path $install | Out-Null
+          New-Item -ItemType Directory -Path $unpacked | Out-Null
+          New-Item -ItemType Directory -Path $away | Out-Null
+          $archive = Join-Path $install '${{ matrix.package }}'
+          Copy-Item -LiteralPath (Join-Path $repo 'release\${{ matrix.package }}') -Destination $archive
+          Copy-Item -LiteralPath (Join-Path $repo 'release\SHA256SUMS.txt') -Destination (Join-Path $install 'SHA256SUMS.txt')
+          Expand-Archive -LiteralPath $archive -DestinationPath $unpacked
+          $packageRoot = Join-Path $unpacked '${{ matrix.package_root }}'
+          $reporter = Join-Path $repo 'scripts\ci-test-report.py'
+          $acceptance = Join-Path $repo 'scripts\acceptance.py'
+          $report = Join-Path $repo 'artifacts\package-acceptance-command.json'
+          $stdout = Join-Path $repo 'artifacts\package-acceptance.stdout.log'
+          $stderr = Join-Path $repo 'artifacts\package-acceptance.stderr.log'
+          $fixtures = Join-Path $repo 'examples\sample'
+          Push-Location $away
+          python -B $reporter --report $report --stdout-log $stdout --stderr-log $stderr -- python -B $acceptance `
+            --binary (Join-Path $packageRoot 'archivebridge.exe') `
+            --expected-version 0.1.0 `
+            --expected-commit $env:GITHUB_SHA `
+            --fixtures-dir $fixtures `
+            --out (Join-Path $repo 'artifacts\package acceptance') `
+            --package $archive `
+            --package-root $packageRoot
+          $code = $LASTEXITCODE
+          Pop-Location
+          if ($code -ne 0) { exit $code }
+
+      - name: Accept extracted package away from checkout on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          install="${RUNNER_TEMP}/ArchiveBridge package acceptance with spaces"
+          unpacked="$install/unpacked package with spaces"
+          away="$RUNNER_TEMP/working directory away from checkout"
+          mkdir -p "$unpacked" "$away"
+          archive="$install/${{ matrix.package }}"
+          cp -- "release/${{ matrix.package }}" "$archive"
+          cp -- "release/SHA256SUMS.txt" "$install/SHA256SUMS.txt"
+          tar -xzf "$archive" -C "$unpacked"
+          package_root="$unpacked/${{ matrix.package_root }}"
+          cd "$away"
+          python -B "$GITHUB_WORKSPACE/scripts/ci-test-report.py" \
+            --report "$GITHUB_WORKSPACE/artifacts/package-acceptance-command.json" \
+            --stdout-log "$GITHUB_WORKSPACE/artifacts/package-acceptance.stdout.log" \
+            --stderr-log "$GITHUB_WORKSPACE/artifacts/package-acceptance.stderr.log" \
+            -- python -B "$GITHUB_WORKSPACE/scripts/acceptance.py" \
+              --binary "$package_root/archivebridge" \
+              --expected-version 0.1.0 \
+              --expected-commit "$GITHUB_SHA" \
+              --fixtures-dir "$GITHUB_WORKSPACE/examples/sample" \
+              --out "$GITHUB_WORKSPACE/artifacts/package acceptance" \
+              --package "$archive" \
+              --package-root "$package_root"
+
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: archivebridge-ci-${{ matrix.platform }}-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          retention-days: 30
+          if-no-files-found: error
+          path: |
+            artifacts/**
+            release/**
