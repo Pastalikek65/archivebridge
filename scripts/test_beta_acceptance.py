@@ -78,6 +78,43 @@ class BetaAcceptanceSafetyTests(unittest.TestCase):
             observed = beta._require_live_stage_checkpoint(process, output, "c" * 64, min_member_bytes=1024 * 1024)
             self.assertEqual(observed["observedMemberBytes"]["member-active"], 1024 * 1024)
 
+    def test_checkpoint_treats_transient_missing_entry_as_waitable_only_while_child_lives(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "archive"
+            stage = output / ".archivebridge-staging"
+            stage.mkdir(parents=True)
+            (stage / ".archivebridge-stage-owner.json").write_text(
+                json.dumps({"schemaVersion": 1, "planId": "7" * 64}) + "\n", encoding="utf-8"
+            )
+            member = stage / "member-active"
+            member.write_bytes(b"x" * (1024 * 1024))
+            original_lstat = Path.lstat
+            vanished = False
+
+            def disappear_once(path):
+                nonlocal vanished
+                if path == member and not vanished:
+                    vanished = True
+                    raise FileNotFoundError("simulated atomic temp-name removal")
+                return original_lstat(path)
+
+            live = SimpleNamespace(poll=lambda: None)
+            with mock.patch.object(Path, "lstat", disappear_once):
+                with self.assertRaises(beta.AcceptanceFailure) as raised:
+                    beta._require_live_stage_checkpoint(live, output, "7" * 64, min_member_bytes=1024 * 1024)
+            self.assertTrue(beta._checkpoint_waitable(raised.exception))
+            checkpoint = beta._require_live_stage_checkpoint(live, output, "7" * 64, min_member_bytes=1024 * 1024)
+            self.assertEqual(checkpoint["observedMemberBytes"]["member-active"], 1024 * 1024)
+
+            vanished = False
+            exited_during_scan = SimpleNamespace(poll=mock.Mock(side_effect=(None, 17)))
+            with mock.patch.object(Path, "lstat", disappear_once):
+                with self.assertRaises(beta.AcceptanceFailure) as exited:
+                    beta._require_live_stage_checkpoint(
+                        exited_during_scan, output, "7" * 64, min_member_bytes=1024 * 1024,
+                    )
+            self.assertFalse(beta._checkpoint_waitable(exited.exception))
+
     def test_pre_checkpoint_initialization_errors_are_waitable_but_unsafe_state_is_not(self):
         self.assertTrue(beta._checkpoint_waitable(beta.AcceptanceFailure("live export did not expose a real owned staging directory")))
         self.assertTrue(beta._checkpoint_waitable(beta.AcceptanceFailure("staging directory has no regular owner marker")))

@@ -408,7 +408,16 @@ def _require_live_stage_checkpoint(process: Any, output: Path, plan_id: Optional
     nonempty: List[str] = []
     observed_sizes: Dict[str, int] = {}
     for child in stage.iterdir():
-        info = child.lstat()
+        try:
+            info = child.lstat()
+        except FileNotFoundError as exc:
+            # A completed stage member is atomically linked into the CAS and
+            # its temporary stage name is removed by the live exporter. The
+            # bounded outer checkpoint poll retries this one observation race
+            # only while the owned process is still alive.
+            if process.poll() is None:
+                raise AcceptanceFailure("staging entry disappeared during live checkpoint scan") from exc
+            raise AcceptanceFailure("export child exited while a staging entry was being inspected") from exc
         if stat.S_ISLNK(info.st_mode) or _is_reparse(info):
             raise AcceptanceFailure("staging directory contains a link or reparse point")
         if child.name == owner_path.name:
@@ -455,6 +464,7 @@ def _checkpoint_waitable(error: AcceptanceFailure) -> bool:
     return any(fragment in message for fragment in (
         "did not expose a real owned staging directory",
         "has no regular owner marker",
+        "staging entry disappeared during live checkpoint scan",
         "no observed nonzero partial member",
         "has not reached the required partial-member threshold",
         "fewer than eight completed CAS members",
