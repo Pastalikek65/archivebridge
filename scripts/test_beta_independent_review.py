@@ -63,6 +63,53 @@ class HungOwnedChild:
 
 
 class BetaAcceptanceIndependentTests(unittest.TestCase):
+    def test_windows_rejects_inflight_append_that_breaks_source_prefix(self):
+        payload = bytes(range(256)) * ((1024 * 1024 + 65536) // 256)
+        paused_bytes = 1024 * 1024 + 17
+        plan_id = "f" * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "independent-recovery.zip"
+            with zipfile.ZipFile(source, "w", compression=zipfile.ZIP_STORED) as archive_zip:
+                archive_zip.writestr(beta.RECOVERY_LARGE_ENTRY_PATH, payload)
+            archive = root / "output"
+            stage = archive / ".archivebridge-staging"
+            stage.mkdir(parents=True)
+            owner_bytes = (json.dumps({"schemaVersion": 1, "planId": plan_id}, separators=(",", ":")) + "\n").encode()
+            (stage / ".archivebridge-stage-owner.json").write_bytes(owner_bytes)
+            member = stage / "member-independent"
+            member.write_bytes(payload[:paused_bytes])
+            plan = {
+                "id": plan_id,
+                "files": [{
+                    "entryPath": beta.RECOVERY_LARGE_ENTRY_PATH,
+                    "bytes": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }],
+            }
+            paused_snapshot = beta._stage_snapshot(archive)
+            checkpoint = {
+                "planId": plan_id,
+                "stageDevice": stage.stat().st_dev,
+                "stageInode": stage.stat().st_ino,
+                "ownerMarkerSha256": hashlib.sha256(owner_bytes).hexdigest(),
+                "nonemptyMembers": [member.name],
+                "requiredPartialMemberBytes": 1024 * 1024,
+                "pausedStageSnapshot": paused_snapshot,
+                "pausedStageFileIdentities": beta._stage_file_identities(archive),
+            }
+            bad_append = bytearray(payload[paused_bytes:paused_bytes + 64])
+            bad_append[-1] ^= 0x01
+            with member.open("ab") as stream:
+                stream.write(bad_append)
+
+            with mock.patch.object(beta.platform, "system", return_value="Windows"):
+                with self.assertRaisesRegex(beta.AcceptanceFailure, "source ZIP prefix"):
+                    beta._validate_post_termination_stage(
+                        archive, checkpoint, source, plan, expected_entry_bytes=len(payload),
+                    )
+            self.assertEqual(checkpoint["pausedStageSnapshot"], paused_snapshot)
+
     @staticmethod
     def _encoded_command():
         command = ["test-only-native-child"]

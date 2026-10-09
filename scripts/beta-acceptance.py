@@ -47,6 +47,8 @@ SOURCE_SCOPE = "beta-native-recovery-comparison-legacy-compatibility"
 PACKAGE_SCOPE = "beta-package-native-recovery-comparison-legacy-compatibility"
 EXPECTED_BETA_GO_VERSION = "go1.27.2"
 LARGE_MEMBER_BYTES = 128 * 1024 * 1024
+MAX_PENDING_IO_APPEND_BYTES = 32 * 1024
+RECOVERY_LARGE_ENTRY_PATH = "Takeout/Google Photos/Batch/zzzz-large.jpg"
 RECOVERY_FIXTURE_ENCODING = "deterministic repeated 16-KiB byte stream; source ZIP_STORED; not representative of JPEG compression"
 MEASUREMENT_KILL_WAIT_SECONDS = 10
 MEASUREMENT_STREAM_JOIN_SECONDS = 5
@@ -389,7 +391,8 @@ class Evidence:
             raise AcceptanceFailure("refusing to overwrite an existing beta acceptance report") from exc
 
 
-def _require_live_stage_checkpoint(process: Any, output: Path, plan_id: Optional[str] = None, *, min_member_bytes: int = 1) -> Dict[str, Any]:
+def _require_live_stage_checkpoint(process: Any, output: Path, plan_id: Optional[str] = None, *,
+                                   min_member_bytes: int = 1, max_member_bytes: Optional[int] = None) -> Dict[str, Any]:
     """Require evidence from a still-running owned child, not an exit status."""
     if process.poll() is not None:
         raise AcceptanceFailure("export child exited before a live staging checkpoint was observed")
@@ -433,10 +436,16 @@ def _require_live_stage_checkpoint(process: Any, output: Path, plan_id: Optional
         raise AcceptanceFailure("staging directory has no observed nonzero partial member while its child is alive")
     if not any(size >= min_member_bytes for size in observed_sizes.values()):
         raise AcceptanceFailure(f"staging has not reached the required partial-member threshold of {min_member_bytes} bytes")
+    if max_member_bytes is not None and not any(
+        name.startswith("member-") and min_member_bytes <= size < max_member_bytes
+        for name, size in observed_sizes.items()
+    ):
+        raise AcceptanceFailure(f"staging has no active member below the required partial-member limit of {max_member_bytes} bytes")
     return {
         "stagePath": str(stage), "stageDevice": stage_stat.st_dev, "stageInode": stage_stat.st_ino,
         "ownerMarkerSha256": _sha256(owner_bytes), "planId": owner["planId"], "nonemptyMembers": nonempty,
         "observedMemberBytes": observed_sizes, "requiredPartialMemberBytes": min_member_bytes,
+        "maximumPartialMemberBytes": max_member_bytes,
     }
 
 
@@ -467,6 +476,7 @@ def _checkpoint_waitable(error: AcceptanceFailure) -> bool:
         "staging entry disappeared during live checkpoint scan",
         "no observed nonzero partial member",
         "has not reached the required partial-member threshold",
+        "has no active member below the required partial-member limit",
         "fewer than eight completed CAS members",
     ))
 
@@ -686,14 +696,177 @@ def _stage_snapshot(output: Path) -> Dict[str, Any]:
     return entries
 
 
+def _stage_file_identities(output: Path) -> Dict[str, Dict[str, int]]:
+    stage = output / ".archivebridge-staging"
+    if not _real_dir(stage):
+        raise AcceptanceFailure("expected owned staging directory is missing")
+    identities: Dict[str, Dict[str, int]] = {}
+    for child in sorted(stage.iterdir(), key=lambda item: item.name):
+        try:
+            info = child.lstat()
+        except OSError as exc:
+            raise AcceptanceFailure(f"cannot inspect staging member identity: {exc}") from exc
+        if (stat.S_ISLNK(info.st_mode) or _is_reparse(info) or not stat.S_ISREG(info.st_mode)
+                or getattr(info, "st_nlink", 1) != 1):
+            raise AcceptanceFailure("staging identity contains a link, hardlink, or non-regular member")
+        if not isinstance(info.st_ino, int) or info.st_ino <= 0:
+            raise AcceptanceFailure("staging member has no stable filesystem identity")
+        identities[child.name] = {
+            "device": int(info.st_dev), "inode": int(info.st_ino), "links": int(info.st_nlink),
+        }
+    return identities
+
+
+def _verify_synthetic_stage_prefix(source_zip: Path, entry_path: str, member_path: Path,
+                                   paused_bytes: int, post_bytes: int, paused_sha256: str,
+                                   expected_full_sha256: str, expected_entry_bytes: int) -> None:
+    if not _real_file(source_zip):
+        raise AcceptanceFailure("recovery source ZIP is not a regular non-link file")
+    try:
+        with zipfile.ZipFile(source_zip, "r") as source:
+            matches = [item for item in source.infolist() if item.filename == entry_path and not item.is_dir()]
+            if len(matches) != 1:
+                raise AcceptanceFailure("synthetic recovery source does not contain one unique large member")
+            info = matches[0]
+            if info.compress_type != zipfile.ZIP_STORED or info.file_size != expected_entry_bytes:
+                raise AcceptanceFailure("synthetic recovery source member has an unexpected encoding or size")
+            source_hash = hashlib.sha256()
+            paused_hash = hashlib.sha256()
+            offset = 0
+            with source.open(info, "r") as source_stream, member_path.open("rb") as stage_stream:
+                while True:
+                    source_chunk = source_stream.read(1024 * 1024)
+                    if not source_chunk:
+                        break
+                    source_hash.update(source_chunk)
+                    if offset < post_bytes:
+                        compare_count = min(len(source_chunk), post_bytes - offset)
+                        staged_chunk = stage_stream.read(compare_count)
+                        if len(staged_chunk) != compare_count or staged_chunk != source_chunk[:compare_count]:
+                            raise AcceptanceFailure("post-termination stage bytes are not the source ZIP prefix")
+                        paused_count = min(compare_count, max(0, paused_bytes - offset))
+                        if paused_count:
+                            paused_hash.update(staged_chunk[:paused_count])
+                    offset += len(source_chunk)
+                if stage_stream.read(1):
+                    raise AcceptanceFailure("post-termination stage member grew while its source prefix was checked")
+            if offset != expected_entry_bytes or source_hash.hexdigest() != expected_full_sha256:
+                raise AcceptanceFailure("synthetic recovery source member differs from the planned full content")
+            if paused_hash.hexdigest() != paused_sha256:
+                raise AcceptanceFailure("paused stage bytes are not preserved as the original source prefix")
+    except AcceptanceFailure:
+        raise
+    except (OSError, zipfile.BadZipFile, RuntimeError, EOFError) as exc:
+        raise AcceptanceFailure(f"cannot verify interrupted stage against its synthetic source ZIP: {exc}") from exc
+
+
+def _validate_post_termination_stage(output: Path, checkpoint: Dict[str, Any],
+                                     source_zip: Path, plan: Mapping[str, Any], *,
+                                     platform_name: Optional[str] = None,
+                                     expected_entry_bytes: int = LARGE_MEMBER_BYTES) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Validate exact retention, with only one source-proven Windows pending write allowed."""
+    os_name = platform.system() if platform_name is None else platform_name
+    if os_name not in ("Windows", "Linux"):
+        raise AcceptanceFailure("forced-death stage validation supports Windows and Linux only")
+    before = checkpoint.get("pausedStageSnapshot")
+    paused_ids = checkpoint.get("pausedStageFileIdentities")
+    if not isinstance(before, dict) or not isinstance(paused_ids, dict):
+        raise AcceptanceFailure("paused stage snapshot or filesystem identities are missing")
+    owner_name = ".archivebridge-stage-owner.json"
+    if owner_name not in before or set(before) != set(paused_ids):
+        raise AcceptanceFailure("paused stage member inventory is incomplete")
+    stage = output / ".archivebridge-staging"
+    if not _real_dir(stage):
+        raise AcceptanceFailure("owned staging directory disappeared after child termination")
+    stage_info = stage.stat()
+    if (stage_info.st_dev != checkpoint.get("stageDevice")
+            or stage_info.st_ino != checkpoint.get("stageInode")):
+        raise AcceptanceFailure("staging directory identity changed after child termination")
+    owner_path = stage / owner_name
+    if (not _real_file(owner_path)
+            or _sha256_file(owner_path)[1] != checkpoint.get("ownerMarkerSha256")):
+        raise AcceptanceFailure("staging owner marker changed after child termination")
+    after = _stage_snapshot(output)
+    after_ids = _stage_file_identities(output)
+    if set(after) != set(before) or set(after_ids) != set(paused_ids):
+        raise AcceptanceFailure("staging member inventory changed after child termination")
+    for name in before:
+        if after_ids[name] != paused_ids[name]:
+            raise AcceptanceFailure("staging member filesystem identity changed after child termination")
+    member_names = [name for name in before if name.startswith("member-")]
+    if len(member_names) != 1 or set(before) != {owner_name, member_names[0]}:
+        raise AcceptanceFailure("synthetic recovery stage does not contain exactly one active member")
+    member_name = member_names[0]
+    paused_member = before[member_name]
+    after_member = after[member_name]
+    min_partial_bytes = checkpoint.get("requiredPartialMemberBytes", 1)
+    if (not isinstance(min_partial_bytes, int) or isinstance(min_partial_bytes, bool)
+            or paused_member.get("bytes", 0) < min_partial_bytes
+            or paused_member.get("bytes", 0) >= expected_entry_bytes):
+        raise AcceptanceFailure("paused recovery member was not a bounded partial source prefix")
+    extension_bytes = after_member.get("bytes", 0) - paused_member.get("bytes", 0)
+    if extension_bytes < 0:
+        raise AcceptanceFailure("staging member shrank after child termination")
+    if extension_bytes == 0:
+        if after_member != paused_member:
+            raise AcceptanceFailure("staging member changed in place after child termination")
+    elif os_name != "Windows":
+        raise AcceptanceFailure("non-Windows staging grew after child termination")
+    elif extension_bytes > MAX_PENDING_IO_APPEND_BYTES:
+        raise AcceptanceFailure("Windows staging growth exceeded one bounded in-flight write")
+    if after_member.get("bytes", 0) > expected_entry_bytes:
+        raise AcceptanceFailure("post-termination stage member exceeds its synthetic source entry")
+
+    files = plan.get("files")
+    if not isinstance(files, list):
+        raise AcceptanceFailure("interruption plan has no file inventory")
+    planned = [
+        item for item in files if isinstance(item, dict)
+        and item.get("entryPath") == RECOVERY_LARGE_ENTRY_PATH
+    ]
+    if (len(planned) != 1 or planned[0].get("bytes") != expected_entry_bytes
+            or not re.fullmatch(r"[0-9a-f]{64}", str(planned[0].get("sha256", "")))):
+        raise AcceptanceFailure("interruption plan does not uniquely bind the synthetic large source member")
+    _verify_synthetic_stage_prefix(
+        source_zip, RECOVERY_LARGE_ENTRY_PATH, stage / member_name,
+        paused_member["bytes"], after_member["bytes"], paused_member["sha256"],
+        planned[0]["sha256"], expected_entry_bytes,
+    )
+    evidence = {
+        "schemaVersion": 1,
+        "policy": ("windows-bounded-in-flight-write-v1" if os_name == "Windows"
+                   else "linux-exact-no-growth-v1"),
+        "maxAppendBytes": MAX_PENDING_IO_APPEND_BYTES,
+        "memberName": member_name,
+        "extensionBytes": extension_bytes,
+        "pausedMember": paused_member,
+        "postTerminationMember": after_member,
+        "pausedFileIdentity": paused_ids[member_name],
+        "postTerminationFileIdentity": after_ids[member_name],
+        "stageDevice": int(stage_info.st_dev),
+        "stageInode": int(stage_info.st_ino),
+        "ownerMarkerSha256": checkpoint["ownerMarkerSha256"],
+        "sourceEntryPath": RECOVERY_LARGE_ENTRY_PATH,
+        "sourceEntryBytes": expected_entry_bytes,
+        "sourceEntrySha256": planned[0]["sha256"],
+        "pausedPrefixMatchesSource": True,
+        "postTerminationPrefixMatchesSource": True,
+    }
+    checkpoint["postTerminationStageSnapshot"] = after
+    checkpoint["postTerminationStageFileIdentities"] = after_ids
+    checkpoint["postTerminationIO"] = evidence
+    return after, evidence
+
+
 def _copy_interrupted_stage_snapshot(out: Path, archive: Path, plan_id: str,
                                      checkpoint: Mapping[str, Any]) -> Dict[str, Any]:
     """Retain a bounded owned-stage snapshot before a successful resume removes it."""
     before = _stage_snapshot(archive)
     owner_name = ".archivebridge-stage-owner.json"
+    expected_after_death = checkpoint.get("postTerminationStageSnapshot")
     if (checkpoint.get("planId") != plan_id or owner_name not in before
-            or before != checkpoint.get("pausedStageSnapshot")):
-        raise AcceptanceFailure("post-death stage differs from the observed plan-owned checkpoint")
+            or not isinstance(expected_after_death, dict) or before != expected_after_death):
+        raise AcceptanceFailure("post-death stage differs from the validated post-termination snapshot")
     if set(before) - {owner_name} and any(
         not name.startswith(("member-", "manifest-")) for name in set(before) - {owner_name}
     ):
@@ -705,6 +878,9 @@ def _copy_interrupted_stage_snapshot(out: Path, archive: Path, plan_id: str,
         raise AcceptanceFailure("post-death stage exceeds its bounded snapshot size")
 
     stage = archive / ".archivebridge-staging"
+    expected_ids = checkpoint.get("postTerminationStageFileIdentities")
+    if not isinstance(expected_ids, dict) or _stage_file_identities(archive) != expected_ids:
+        raise AcceptanceFailure("post-death stage filesystem identities differ from the validated snapshot")
     if before[owner_name]["bytes"] > 1024 * 1024:
         raise AcceptanceFailure("post-death stage owner marker exceeds its size bound")
     owner_bytes = (stage / owner_name).read_bytes()
@@ -758,7 +934,8 @@ def _copy_interrupted_stage_snapshot(out: Path, archive: Path, plan_id: str,
                 or getattr(after, "st_ino", None) != getattr(source_info, "st_ino", None)):
             raise AcceptanceFailure("copied post-death stage member does not match its live source")
         copied[name] = copied_identity
-    if _stage_snapshot(archive) != before:
+    if (_stage_snapshot(archive) != before
+            or _stage_file_identities(archive) != expected_ids):
         raise AcceptanceFailure("live stage changed during snapshot copy")
     snapshot_files: set[str] = set()
     for entry in snapshot_root.iterdir():
@@ -1531,7 +1708,10 @@ def _forced_death_flow(evidence: Evidence, binary: Path, out: Path) -> Tuple[Dic
                 candidates = _count_completed_cas_candidates(plan, archive, min_member_bytes=64 * 1024)
                 if len(candidates) < 8:
                     raise AcceptanceFailure("fewer than eight completed CAS members are available before the active large write")
-                checkpoint = _require_live_stage_checkpoint(process, archive, plan.get("id"), min_member_bytes=1024 * 1024)
+                checkpoint = _require_live_stage_checkpoint(
+                    process, archive, plan.get("id"), min_member_bytes=1024 * 1024,
+                    max_member_bytes=LARGE_MEMBER_BYTES,
+                )
                 break
             except AcceptanceFailure as exc:
                 if process.poll() is not None:
@@ -1552,12 +1732,25 @@ def _forced_death_flow(evidence: Evidence, binary: Path, out: Path) -> Tuple[Dic
         pause_evidence = _suspend_owned_process(process)
         forced_record["pause"] = pause_evidence
         checkpoint["pausedStageSnapshot"] = _stage_snapshot(archive)
+        checkpoint["pausedStageFileIdentities"] = _stage_file_identities(archive)
+        paused_members = [
+            (name, identity) for name, identity in checkpoint["pausedStageSnapshot"].items()
+            if name.startswith("member-")
+        ]
+        if (len(paused_members) != 1
+                or set(checkpoint["pausedStageSnapshot"]) != {
+                    ".archivebridge-stage-owner.json", paused_members[0][0],
+                }
+                or paused_members[0][1]["bytes"] < checkpoint["requiredPartialMemberBytes"]
+                or paused_members[0][1]["bytes"] >= LARGE_MEMBER_BYTES):
+            raise AcceptanceFailure("paused recovery stage is not one bounded partial large-member write")
         completed = _capture_completed_cas(plan, archive, min_member_bytes=64 * 1024)
         if len(completed) < 8:
             raise AcceptanceFailure("fewer than eight completed CAS members passed hash verification after the exporter pause")
         checkpoint["completedCASFiles"] = len(completed)
         _assert_stage_preserved(archive, checkpoint)
         forced_record["pausedStageSnapshot"] = checkpoint["pausedStageSnapshot"]
+        forced_record["pausedStageFileIdentities"] = checkpoint["pausedStageFileIdentities"]
         contender = evidence.run("active-writer-contender", [str(binary), "resume", "--plan", str(plan_path), "--out", str(archive), "--json"], timeout=30)
         try:
             contender_payload = json.loads(contender["stdout"])
@@ -1584,8 +1777,13 @@ def _forced_death_flow(evidence: Evidence, binary: Path, out: Path) -> Tuple[Dic
                               "stdoutBase64": base64.b64encode(child_stdout).decode("ascii"), "stderrBase64": base64.b64encode(child_stderr).decode("ascii")})
         if killed_exit == 0:
             raise AcceptanceFailure("forced termination did not produce a nonzero owned-child exit")
-        _assert_stage_preserved(archive, checkpoint)
-        retained = _stage_snapshot(archive)
+        retained, post_termination_io = _validate_post_termination_stage(
+            archive, checkpoint, source, plan,
+        )
+        forced_record["pausedStageFileIdentities"] = checkpoint["pausedStageFileIdentities"]
+        forced_record["postTerminationIO"] = post_termination_io
+        forced_record["postTerminationStageSnapshot"] = retained
+        forced_record["postTerminationStageFileIdentities"] = checkpoint["postTerminationStageFileIdentities"]
         stage_snapshot = _copy_interrupted_stage_snapshot(out, archive, plan["id"], checkpoint)
         for rel, identity in completed.items():
             path = archive.joinpath(*rel.split("/"))
@@ -1595,7 +1793,10 @@ def _forced_death_flow(evidence: Evidence, binary: Path, out: Path) -> Tuple[Dic
         if source_identity != (fixture["bytes"], fixture["sha256"]):
             raise AcceptanceFailure("synthetic ZIP source changed during interrupted export")
         info = {**fixture, "planPath": str(plan_path), "planId": plan["id"], "archivePath": str(archive), "sourceBeforeAfter": {"bytes": source_identity[0], "sha256": source_identity[1]},
-                "completedCAS": completed, "retainedStageAfterDeath": retained, "stageSnapshot": stage_snapshot,
+                "completedCAS": completed, "retainedStageAfterDeath": retained,
+                "postTerminationStageSnapshot": retained, "postTerminationIO": post_termination_io,
+                "postTerminationStageFileIdentities": checkpoint["postTerminationStageFileIdentities"],
+                "stageSnapshot": stage_snapshot,
                 "checkpoint": checkpoint, "plan": plan}
         evidence.check("actual-forced-process-death-retains-owned-state", True, "the harness observed a nonzero stage file while its native child was alive, terminated that exact child, and verified the partial owner-bound stage remained", {
             "pid": process.pid, "exitCode": killed_exit, "stageMemberCount": len(retained), "completedCASFiles": len(completed)})

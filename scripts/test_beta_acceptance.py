@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -29,6 +30,135 @@ SPEC.loader.exec_module(beta)
 
 
 class BetaAcceptanceSafetyTests(unittest.TestCase):
+    def _post_termination_fixture(self, root: Path, payload: bytes, paused_bytes: int,
+                                 source_payload: bytes | None = None):
+        plan_id = "9" * 64
+        source = root / "recovery.zip"
+        entry_payload = payload if source_payload is None else source_payload
+        with zipfile.ZipFile(source, "w", compression=zipfile.ZIP_STORED) as archive_zip:
+            archive_zip.writestr(beta.RECOVERY_LARGE_ENTRY_PATH, entry_payload)
+        archive = root / "archive"
+        stage = archive / ".archivebridge-staging"
+        stage.mkdir(parents=True)
+        owner_bytes = (json.dumps({"schemaVersion": 1, "planId": plan_id}, separators=(",", ":")) + "\n").encode()
+        (stage / ".archivebridge-stage-owner.json").write_bytes(owner_bytes)
+        member = stage / "member-active"
+        member.write_bytes(payload[:paused_bytes])
+        plan = {
+            "id": plan_id,
+            "files": [{
+                "entryPath": beta.RECOVERY_LARGE_ENTRY_PATH,
+                "bytes": len(entry_payload),
+                "sha256": hashlib.sha256(entry_payload).hexdigest(),
+            }],
+        }
+        paused = beta._stage_snapshot(archive)
+        checkpoint = {
+            "planId": plan_id,
+            "stageDevice": stage.stat().st_dev,
+            "stageInode": stage.stat().st_ino,
+            "ownerMarkerSha256": hashlib.sha256(owner_bytes).hexdigest(),
+            "nonemptyMembers": ["member-active"],
+            "observedMemberBytes": {"member-active": paused_bytes},
+            "requiredPartialMemberBytes": 1024 * 1024,
+            "pausedStageSnapshot": paused,
+            "pausedStageFileIdentities": beta._stage_file_identities(archive),
+        }
+        return source, archive, stage, member, plan, checkpoint
+
+    def test_windows_post_termination_one_write_append_keeps_exact_paused_baseline(self):
+        payload = bytes(range(256)) * ((1024 * 1024 + 65536) // 256)
+        paused_bytes = 1024 * 1024 + 17
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, archive, _stage, member, plan, checkpoint = self._post_termination_fixture(
+                root, payload, paused_bytes,
+            )
+            paused = checkpoint["pausedStageSnapshot"]
+            with member.open("ab") as stream:
+                stream.write(payload[paused_bytes:paused_bytes + beta.MAX_PENDING_IO_APPEND_BYTES])
+            with mock.patch.object(beta.platform, "system", return_value="Windows"):
+                post_snapshot, evidence = beta._validate_post_termination_stage(
+                    archive, checkpoint, source, plan, expected_entry_bytes=len(payload),
+                )
+            self.assertEqual(checkpoint["pausedStageSnapshot"], paused)
+            self.assertEqual(post_snapshot, beta._stage_snapshot(archive))
+            self.assertEqual(evidence["schemaVersion"], 1)
+            self.assertEqual(evidence["policy"], "windows-bounded-in-flight-write-v1")
+            self.assertEqual(evidence["memberName"], "member-active")
+            self.assertEqual(evidence["extensionBytes"], beta.MAX_PENDING_IO_APPEND_BYTES)
+            self.assertEqual(evidence["pausedMember"], paused["member-active"])
+            self.assertEqual(evidence["postTerminationMember"], post_snapshot["member-active"])
+            self.assertTrue(evidence["pausedPrefixMatchesSource"])
+            self.assertTrue(evidence["postTerminationPrefixMatchesSource"])
+            retained = beta._copy_interrupted_stage_snapshot(root, archive, plan["id"], checkpoint)
+            self.assertEqual(retained["members"], post_snapshot)
+            self.assertEqual(beta._stage_snapshot(archive), post_snapshot)
+
+    def test_post_termination_rejects_corruption_wrong_source_oversize_new_member_and_marker_change(self):
+        payload = bytes(range(256)) * ((1024 * 1024 + 65536) // 256)
+        paused_bytes = 1024 * 1024 + 17
+        mutations = ("corrupt-prefix", "wrong-source", "oversize", "new-member", "owner-marker",
+                     "shrink", "replacement")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source_payload = payload[::-1] if mutation == "wrong-source" else None
+                source, archive, stage, member, plan, checkpoint = self._post_termination_fixture(
+                    root, payload, paused_bytes, source_payload,
+                )
+                if mutation == "corrupt-prefix":
+                    with member.open("r+b") as stream:
+                        stream.seek(0)
+                        stream.write(b"!")
+                        stream.flush()
+                elif mutation == "oversize":
+                    with member.open("ab") as stream:
+                        stream.write(payload[paused_bytes:paused_bytes + beta.MAX_PENDING_IO_APPEND_BYTES + 1])
+                elif mutation == "new-member":
+                    (stage / "member-foreign").write_bytes(b"unexpected")
+                elif mutation == "owner-marker":
+                    owner = stage / ".archivebridge-stage-owner.json"
+                    owner.write_bytes(owner.read_bytes() + b" ")
+                elif mutation == "wrong-source":
+                    with member.open("ab") as stream:
+                        stream.write(payload[paused_bytes:paused_bytes + 1])
+                elif mutation == "shrink":
+                    with member.open("r+b") as stream:
+                        stream.truncate(paused_bytes - 1)
+                elif mutation == "replacement":
+                    saved = stage / "member-saved"
+                    member.replace(saved)
+                    member.write_bytes(payload[:paused_bytes])
+                    saved.unlink()
+                with mock.patch.object(beta.platform, "system", return_value="Windows"):
+                    with self.assertRaises(beta.AcceptanceFailure):
+                        beta._validate_post_termination_stage(
+                            archive, checkpoint, source, plan, expected_entry_bytes=len(payload),
+                        )
+
+    def test_linux_post_termination_rejects_any_growth_but_accepts_exact_retention(self):
+        payload = bytes(range(256)) * ((1024 * 1024 + 65536) // 256)
+        paused_bytes = 1024 * 1024 + 17
+        with tempfile.TemporaryDirectory() as temporary:
+            source, archive, _stage, member, plan, checkpoint = self._post_termination_fixture(
+                Path(temporary), payload, paused_bytes,
+            )
+            with mock.patch.object(beta.platform, "system", return_value="Linux"):
+                snapshot, evidence = beta._validate_post_termination_stage(
+                    archive, checkpoint, source, plan, expected_entry_bytes=len(payload),
+                )
+            self.assertEqual(snapshot, checkpoint["pausedStageSnapshot"])
+            self.assertEqual(evidence["policy"], "linux-exact-no-growth-v1")
+            self.assertEqual(evidence["extensionBytes"], 0)
+            with member.open("ab") as stream:
+                stream.write(payload[paused_bytes:paused_bytes + 1])
+            with mock.patch.object(beta.platform, "system", return_value="Linux"):
+                with self.assertRaises(beta.AcceptanceFailure):
+                    beta._validate_post_termination_stage(
+                        archive, checkpoint, source, plan, expected_entry_bytes=len(payload),
+                    )
+
     def test_source_identity_accepts_v1_candidate_and_preserves_beta(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -128,6 +258,13 @@ class BetaAcceptanceSafetyTests(unittest.TestCase):
             observed = beta._require_live_stage_checkpoint(process, output, "c" * 64, min_member_bytes=1024 * 1024)
             self.assertEqual(observed["observedMemberBytes"]["member-active"], 1024 * 1024)
 
+            member.write_bytes(b"x" * beta.LARGE_MEMBER_BYTES)
+            with self.assertRaisesRegex(beta.AcceptanceFailure, "below the required partial-member limit"):
+                beta._require_live_stage_checkpoint(
+                    process, output, "c" * 64, min_member_bytes=1024 * 1024,
+                    max_member_bytes=beta.LARGE_MEMBER_BYTES,
+                )
+
     def test_checkpoint_treats_transient_missing_entry_as_waitable_only_while_child_lives(self):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "archive"
@@ -201,7 +338,10 @@ class BetaAcceptanceSafetyTests(unittest.TestCase):
             (stage / "member-active").write_bytes(b"partially staged content")
             paused = beta._stage_snapshot(archive)
             checkpoint = {"planId": plan_id, "ownerMarkerSha256": beta._sha256(owner_bytes),
-                          "pausedStageSnapshot": paused}
+                          "stageDevice": stage.stat().st_dev, "stageInode": stage.stat().st_ino,
+                          "pausedStageSnapshot": paused,
+                          "postTerminationStageSnapshot": paused,
+                          "postTerminationStageFileIdentities": beta._stage_file_identities(archive)}
 
             snapshot = beta._copy_interrupted_stage_snapshot(output, archive, plan_id, checkpoint)
 
@@ -229,7 +369,10 @@ class BetaAcceptanceSafetyTests(unittest.TestCase):
             (stage / ".archivebridge-stage-owner.json").write_bytes(owner_bytes)
             (stage / "member-active").write_bytes(b"partial")
             checkpoint = {"planId": plan_id, "ownerMarkerSha256": beta._sha256(owner_bytes),
-                          "pausedStageSnapshot": beta._stage_snapshot(archive)}
+                          "stageDevice": stage.stat().st_dev, "stageInode": stage.stat().st_ino,
+                          "pausedStageSnapshot": beta._stage_snapshot(archive),
+                          "postTerminationStageSnapshot": beta._stage_snapshot(archive),
+                          "postTerminationStageFileIdentities": beta._stage_file_identities(archive)}
             (output / "interrupted-stage-snapshot").mkdir()
             with self.assertRaises(beta.AcceptanceFailure):
                 beta._copy_interrupted_stage_snapshot(output, archive, plan_id, checkpoint)
@@ -237,6 +380,8 @@ class BetaAcceptanceSafetyTests(unittest.TestCase):
             (output / "interrupted-stage-snapshot").rmdir()
             (stage / "unexpected").write_bytes(b"unknown")
             checkpoint["pausedStageSnapshot"] = beta._stage_snapshot(archive)
+            checkpoint["postTerminationStageSnapshot"] = beta._stage_snapshot(archive)
+            checkpoint["postTerminationStageFileIdentities"] = beta._stage_file_identities(archive)
             with self.assertRaises(beta.AcceptanceFailure):
                 beta._copy_interrupted_stage_snapshot(output, archive, plan_id, checkpoint)
 
