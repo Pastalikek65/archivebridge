@@ -109,8 +109,11 @@ func TestImmichJournalExclusiveCheckpointsAndOwnership(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if canonical != store.path || record.JournalID != store.journalID || record.Report == nil || record.Report.PlanID != report.PlanID {
-		t.Fatalf("loaded journal did not retain its report: %#v", record)
+	if canonical != store.path {
+		t.Fatalf("loaded journal path differs from its owned path: loaded=%q stored=%q", canonical, store.path)
+	}
+	if record.JournalID != store.journalID || record.Report == nil || record.Report.PlanID != report.PlanID {
+		t.Fatalf("loaded journal did not retain its report: loaded=%#v journalID=%q expectedPlanID=%q", record, store.journalID, report.PlanID)
 	}
 
 	secret := "private-api-key-that-must-not-appear"
@@ -142,6 +145,40 @@ func TestImmichJournalExclusiveCheckpointsAndOwnership(t *testing.T) {
 	}
 	if current, err := os.ReadFile(path); err != nil || !bytes.Equal(current, foreignBytes) {
 		t.Fatalf("unowned report changed after refusal: err=%v", err)
+	}
+}
+
+func TestImmichJournalCanonicalPathComparisonHandlesMixedCaseAncestors(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "reports", "operation.json")
+	if err := os.Mkdir(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := newImmichJournal(path, "immich.import")
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := &immich.Report{
+		SchemaVersion: immich.ReportSchemaVersion, Mode: "import", Status: "in_progress",
+		PlanID: strings.Repeat("a", 64), ManifestSHA256: strings.Repeat("b", 64),
+		ServerOrigin: "https://immich.example", ServerVersion: immich.SupportedServerVersion,
+	}
+	if err := store.checkpoint(report, "in_progress", nil); err != nil {
+		t.Fatal(err)
+	}
+	loadPath := path
+	if runtime.GOOS == "windows" {
+		loadPath = strings.ToUpper(path)
+	}
+	record, canonical, err := loadImmichJournal(loadPath, "immich.import")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonical != store.path {
+		t.Fatalf("case-varied journal paths must identify the same file: loaded=%q stored=%q", canonical, store.path)
+	}
+	if record.JournalID != store.journalID || record.Report == nil {
+		t.Fatalf("case-varied journal load lost owned report identity: loaded=%#v storeID=%q", record, store.journalID)
 	}
 }
 

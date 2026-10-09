@@ -198,15 +198,34 @@ func sameReportPath(a, b string) bool {
 }
 
 func loadImmichJournal(path string, expectedCommand string) (immichJournal, string, error) {
-	canonical, err := filepath.Abs(path)
+	absolute, err := filepath.Abs(path)
 	if err != nil {
 		return immichJournal{}, "", errors.New("report path is invalid")
 	}
-	canonical = filepath.Clean(canonical)
+	absolute = filepath.Clean(absolute)
+	parent := filepath.Dir(absolute)
+	parentInfo, err := os.Lstat(parent)
+	if err != nil || !parentInfo.IsDir() || parentInfo.Mode()&os.ModeSymlink != 0 {
+		return immichJournal{}, "", errors.New("operation report parent is missing, linked, or not a directory")
+	}
+	resolvedParent, err := filepath.EvalSymlinks(parent)
+	if err != nil {
+		return immichJournal{}, "", errors.New("operation report parent could not be resolved safely")
+	}
+	canonical := filepath.Join(resolvedParent, filepath.Base(absolute))
 	info, err := os.Lstat(canonical)
 	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > maxImmichJournal {
 		return immichJournal{}, "", errors.New("operation report is missing, linked, non-regular, or too large")
 	}
+	resolvedFile, err := filepath.EvalSymlinks(canonical)
+	if err != nil {
+		return immichJournal{}, "", errors.New("operation report could not be resolved safely")
+	}
+	resolvedInfo, err := os.Lstat(resolvedFile)
+	if err != nil || !resolvedInfo.Mode().IsRegular() || resolvedInfo.Mode()&os.ModeSymlink != 0 || !os.SameFile(info, resolvedInfo) {
+		return immichJournal{}, "", errors.New("operation report changed while it was being resolved")
+	}
+	canonical = resolvedFile
 	f, err := os.Open(canonical)
 	if err != nil {
 		return immichJournal{}, "", errors.New("operation report could not be opened safely")

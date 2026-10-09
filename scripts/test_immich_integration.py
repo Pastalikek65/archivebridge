@@ -9,6 +9,35 @@ SPEC.loader.exec_module(MODULE)
 
 
 class OwnershipTests(unittest.TestCase):
+    def test_startup_diagnostics_keep_credentials_and_foreign_logs_out(self):
+        import json
+        run = MODULE.OwnedServer()
+        run.created = [('container', 'owned-container'), ('container', 'foreign-container')]
+        calls = []
+        def docker(args, **kwargs):
+            calls.append(args)
+            if args[1] == 'inspect':
+                owner = run.owner if args[-1] == 'owned-container' else 'another-owner'
+                return json.dumps([{'Config': {'Labels': {MODULE.OWNER_LABEL: owner}, 'Env': ['DB_PASSWORD=synthetic-secret']},
+                                    'State': {'Status': 'exited', 'ExitCode': 1, 'OOMKilled': False,
+                                              'Error': 'synthetic-secret', 'Health': {'Status': 'unhealthy', 'Log': ['synthetic-secret']}}}])
+            self.assertEqual(args, ['container', 'logs', '--tail', '80', 'owned-container'])
+            return 'EAI_AGAIN database password=synthetic-secret'
+        run.docker = docker
+        run.capture_startup_diagnostics()
+        self.assertEqual(run.startup_diagnostics[0]['logCategories'], ['dns'])
+        self.assertEqual(run.startup_diagnostics[0]['state'], 'exited')
+        self.assertEqual(run.startup_diagnostics[1], {'identity': 'foreign-container', 'inspection': 'failed'})
+        self.assertNotIn('synthetic-secret', json.dumps(run.startup_diagnostics))
+        self.assertEqual(len(calls), 3)
+
+    def test_log_category_reader_includes_stderr(self):
+        import subprocess
+        import unittest.mock
+        result = subprocess.CompletedProcess([], 0, stdout=b'normal startup', stderr=b'ECONNREFUSED')
+        with unittest.mock.patch.object(MODULE.subprocess, 'run', return_value=result):
+            self.assertIn('ECONNREFUSED', MODULE.docker_command(['container', 'logs', '--tail', '80', 'owned-container']))
+
     def test_conflicting_exif_fixture_is_fixed_original_with_separate_takeout_date(self):
         import hashlib
         import json

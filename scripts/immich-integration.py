@@ -107,6 +107,8 @@ def docker_command(args, env=None):
     except (OSError, subprocess.TimeoutExpired):
         raise Failure('DOCKER_EXECUTION_FAILED') from None
     require(result.returncode == 0, 'DOCKER_COMMAND_FAILED')
+    if args[:2] == ['container', 'logs']:
+        return (result.stdout + result.stderr).decode('utf-8', errors='replace')
     return result.stdout.decode('utf-8', errors='strict').strip()
 
 
@@ -150,6 +152,7 @@ class OwnedServer:
         self.inventory = {}
         self.boundary = {}
         self.engine = {}
+        self.startup_diagnostics = []
 
     def check_engine(self):
         # The ambient context can otherwise target an unrelated remote engine.
@@ -237,7 +240,40 @@ class OwnedServer:
                 if str(error) == 'SERVER_VERSION_MISMATCH':
                     raise
                 time.sleep(1)
+        self.capture_startup_diagnostics()
         raise Failure('SERVER_START_TIMEOUT')
+
+    def capture_startup_diagnostics(self):
+        # Never retain container configuration, environment, raw logs, or
+        # healthcheck output: those may contain generated credentials.
+        categories = {
+            'dns': ('EAI_AGAIN', 'ENOTFOUND', 'could not translate host name'),
+            'connection_refused': ('ECONNREFUSED', 'Connection refused'),
+            'database_auth': ('password authentication failed',),
+            'cpu_instruction': ('Illegal instruction', 'unsupported CPU'),
+            'migration': ('Migration failed', 'migration failed'),
+            'permission': ('Permission denied', 'EACCES'),
+            'listening': ('Immich Server is listening',),
+        }
+        for kind, identity in self.created:
+            if kind != 'container':
+                continue
+            try:
+                rows = json.loads(self.docker(['container', 'inspect', identity]))
+                require(len(rows) == 1 and rows[0].get('Config', {}).get('Labels', {}).get(OWNER_LABEL) == self.owner,
+                        'RESOURCE_OWNER_CHANGED')
+                state = rows[0].get('State', {})
+                logs = self.docker(['container', 'logs', '--tail', '80', identity])
+                self.startup_diagnostics.append({
+                    'identity': identity,
+                    'state': state.get('Status') if state.get('Status') in ('created', 'running', 'paused', 'restarting', 'removing', 'exited', 'dead') else 'unknown',
+                    'exitCode': state.get('ExitCode') if type(state.get('ExitCode')) is int else None,
+                    'oomKilled': state.get('OOMKilled') is True,
+                    'health': state.get('Health', {}).get('Status') if state.get('Health', {}).get('Status') in ('starting', 'healthy', 'unhealthy') else 'not_available',
+                    'logCategories': [name for name, needles in categories.items() if any(needle in logs for needle in needles)],
+                })
+            except (Failure, ValueError, TypeError, AttributeError):
+                self.startup_diagnostics.append({'identity': identity, 'inspection': 'failed'})
 
     def cleanup(self):
         failures = []
@@ -841,6 +877,8 @@ def main():
         report['imageInventory'] = server.inventory
         report['engine'] = server.engine
         report['boundary'] = server.boundary
+        if server.startup_diagnostics:
+            report['startupDiagnostics'] = server.startup_diagnostics
         if error:
             report['status'] = 'failed'
             report['error'] = error
