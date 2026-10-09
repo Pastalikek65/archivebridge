@@ -307,14 +307,38 @@ def _validate_package(args: argparse.Namespace, package: Dict[str, Any], expecte
     root_path = Path(package["rootPath"])
     archive_data = _archive_members(archive_path)
     root_data = _tree_file_bytes(root_path)
+
+    host = platform.system().lower()
+    expected_platform = "windows" if host == "windows" else "linux" if host == "linux" else "unsupported"
+    if expected_platform == "unsupported":
+        raise AcceptanceFailure(f"package validation is unsupported on native platform {host!r}")
+    tag = "win" if expected_platform == "windows" else "linux"
+    top = f"archivebridge-{expected_version}-{tag}-x64"
+    expected_archive_name = f"{top}.zip" if expected_platform == "windows" else f"{top}.tar.gz"
+    if archive_path.name != expected_archive_name or root_path.name != top:
+        raise AcceptanceFailure("package archive and extracted root do not use the expected versioned top-level name")
+
+    # Release archives contain one versioned top-level directory. Normalize
+    # that exact prefix before looking up package-manifest.json so the ZIP/TAR
+    # member keys line up with the extracted root's relative file keys.
+    archive_files: Dict[str, bytes] = {}
+    prefix = top + "/"
+    for full_name, content in archive_data.items():
+        if not full_name.startswith(prefix):
+            raise AcceptanceFailure(f"package archive member is outside top directory {top!r}: {full_name!r}")
+        rel = full_name[len(prefix):]
+        if not _safe_relative(rel) or rel in archive_files:
+            raise AcceptanceFailure(f"package archive has an invalid or duplicate relative member: {rel!r}")
+        archive_files[rel] = content
+
     manifest_name = "package-manifest.json"
-    if manifest_name not in archive_data or manifest_name not in root_data:
+    if manifest_name not in archive_files or manifest_name not in root_data:
         raise AcceptanceFailure("package archive and extracted root must contain package-manifest.json")
     try:
-        manifest = json.loads(archive_data[manifest_name].decode("utf-8"))
+        manifest = json.loads(archive_files[manifest_name].decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise AcceptanceFailure(f"package manifest is invalid UTF-8 JSON: {exc}") from exc
-    if archive_data[manifest_name] != root_data[manifest_name]:
+    if archive_files[manifest_name] != root_data[manifest_name]:
         raise AcceptanceFailure("package manifest bytes differ between archive and extracted root")
     required = {
         "schemaVersion": 1,
@@ -327,24 +351,8 @@ def _validate_package(args: argparse.Namespace, package: Dict[str, Any], expecte
     for key, expected in required.items():
         if manifest.get(key) != expected:
             raise AcceptanceFailure(f"package manifest {key} is {manifest.get(key)!r}; expected {expected!r}")
-    host = platform.system().lower()
-    expected_platform = "windows" if host == "windows" else "linux" if host == "linux" else "unsupported"
     if manifest.get("platform") != expected_platform:
         raise AcceptanceFailure(f"package platform {manifest.get('platform')!r} does not match native host {expected_platform!r}")
-    tag = "win" if expected_platform == "windows" else "linux"
-    top = f"archivebridge-{expected_version}-{tag}-x64"
-    expected_archive_name = f"{top}.zip" if expected_platform == "windows" else f"{top}.tar.gz"
-    if archive_path.name != expected_archive_name or root_path.name != top:
-        raise AcceptanceFailure("package archive and extracted root do not use the expected versioned top-level name")
-    archive_files: Dict[str, bytes] = {}
-    for full_name, content in archive_data.items():
-        prefix = top + "/"
-        if not full_name.startswith(prefix):
-            raise AcceptanceFailure(f"package archive member is outside top directory {top!r}: {full_name!r}")
-        rel = full_name[len(prefix):]
-        if not _safe_relative(rel) or rel in archive_files:
-            raise AcceptanceFailure(f"package archive has an invalid or duplicate relative member: {rel!r}")
-        archive_files[rel] = content
     file_entries = manifest.get("files")
     if not isinstance(file_entries, list):
         raise AcceptanceFailure("package manifest files field is not an array")

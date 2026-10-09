@@ -7,12 +7,15 @@ import io
 import json
 import os
 from pathlib import Path
+import platform
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
+import zipfile
 
 import acceptance
 
@@ -194,6 +197,176 @@ class InitializationSafetyTests(unittest.TestCase):
                 with self.assertRaises(acceptance.AcceptanceFailure):
                     runner.initialize()
             self.assertFalse(output.exists(), "acceptance output must not be created inside a supplied package tree")
+
+
+class PackageValidationTests(unittest.TestCase):
+    def _fixture_entries(self, host_platform: str) -> tuple[str, str, dict[str, bytes], dict[str, object], bool]:
+        version = "0.1.0"
+        tag = "win" if host_platform == "windows" else "linux"
+        top = f"archivebridge-{version}-{tag}-x64"
+        archive_name = top + (".zip" if host_platform == "windows" else ".tar.gz")
+        retained = REPO / "release" / archive_name
+        if retained.is_file():
+            if host_platform == "windows":
+                with zipfile.ZipFile(retained, "r") as source:
+                    entries = {item.filename: source.read(item) for item in source.infolist() if not item.is_dir()}
+            else:
+                entries = {}
+                with tarfile.open(retained, "r:gz") as source:
+                    for item in source.getmembers():
+                        if item.isfile():
+                            member = source.extractfile(item)
+                            if member is not None:
+                                entries[item.name] = member.read()
+            return top, archive_name, entries, json.loads(entries[f"{top}/package-manifest.json"]), True
+
+        binary_name = "archivebridge.exe" if host_platform == "windows" else "archivebridge"
+        if host_platform == "windows":
+            binary = bytearray(96)
+            binary[:2] = b"MZ"
+            binary[60:64] = (64).to_bytes(4, "little")
+            binary[64:68] = b"PE\0\0"
+            binary[68:70] = (0x8664).to_bytes(2, "little")
+        else:
+            # TESTONLY: this ELF-shaped payload is parsed as bytes, never run.
+            binary = bytearray(64)
+            binary[:4] = b"\x7fELF"
+            binary[4:6] = b"\x02\x01"
+            binary[16:18] = (2).to_bytes(2, "little")
+            binary[18:20] = (62).to_bytes(2, "little")
+        binary_bytes = bytes(binary)
+        commit = "a" * 40
+        manifest = {
+            "schemaVersion": 1,
+            "product": "ArchiveBridge",
+            "version": version,
+            "source": commit,
+            "platform": host_platform,
+            "arch": "x64",
+            "goVersion": acceptance.GO_VERSION,
+            "files": [{"path": binary_name, "bytes": len(binary_bytes), "sha256": acceptance._sha256(binary_bytes)}],
+        }
+        entries = {
+            f"{top}/{binary_name}": binary_bytes,
+            f"{top}/package-manifest.json": json.dumps(manifest, separators=(",", ":")).encode("utf-8"),
+        }
+        return top, archive_name, entries, manifest, False
+
+    def _materialize_fixture(
+        self,
+        directory: Path,
+        entries: dict[str, bytes],
+        top: str,
+        archive_name: str,
+        *,
+        retained_archive: Path | None = None,
+        extra_member: tuple[str, bytes] | None = None,
+    ) -> tuple[dict[str, object], Path, str]:
+        archive_path = directory / archive_name
+        if retained_archive is not None and extra_member is None:
+            shutil.copyfile(retained_archive, archive_path)
+        elif archive_name.endswith(".zip"):
+            if retained_archive is not None:
+                shutil.copyfile(retained_archive, archive_path)
+            else:
+                with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED) as archive:
+                    for name, data in sorted(entries.items()):
+                        archive.writestr(name, data)
+            if extra_member is not None:
+                with zipfile.ZipFile(archive_path, "a", compression=zipfile.ZIP_STORED) as archive:
+                    archive.writestr(*extra_member)
+        else:
+            with tarfile.open(archive_path, "w:gz") as archive:
+                members = dict(entries)
+                if extra_member is not None:
+                    members[extra_member[0]] = extra_member[1]
+                for name, data in sorted(members.items()):
+                    member = tarfile.TarInfo(name)
+                    member.size = len(data)
+                    member.mode = 0o644
+                    member.uid = 0
+                    member.gid = 0
+                    member.mtime = 0
+                    archive.addfile(member, io.BytesIO(data))
+
+        root_path = directory / top
+        root_path.mkdir()
+        prefix = top + "/"
+        for full_name, data in entries.items():
+            if not full_name.startswith(prefix):
+                continue
+            relative = full_name[len(prefix):]
+            if not acceptance._safe_relative(relative):
+                continue
+            member_path = root_path.joinpath(*relative.split("/"))
+            member_path.parent.mkdir(parents=True, exist_ok=True)
+            member_path.write_bytes(data)
+
+        binary_name = "archivebridge.exe" if platform.system().lower() == "windows" else "archivebridge"
+        binary_path = root_path / binary_name
+        archive_sha = acceptance._sha256_file(archive_path)[1]
+        checksum_path = directory / "SHA256SUMS.txt"
+        checksum_path.write_bytes(f"{archive_sha}  {archive_name}\n".encode("ascii"))
+        package: dict[str, object] = {
+            "archivePath": str(archive_path),
+            "rootPath": str(root_path),
+            "archiveSha256": archive_sha,
+        }
+        return package, binary_path, str(checksum_path)
+
+    def test_versioned_top_directory_is_removed_before_manifest_lookup(self) -> None:
+        host = "windows" if platform.system().lower() == "windows" else "linux"
+        with tempfile.TemporaryDirectory(prefix="archivebridge-acceptance-package-prefix-") as temp:
+            top, archive_name, entries, manifest, used_retained_release = self._fixture_entries(host)
+            retained_archive = REPO / "release" / archive_name if used_retained_release else None
+            package, binary_path, _checksum = self._materialize_fixture(
+                Path(temp), entries, top, archive_name, retained_archive=retained_archive
+            )
+
+            report = acceptance._validate_package(
+                None,
+                package,
+                str(manifest["version"]),
+                str(manifest["source"]),
+                binary_path,
+            )
+
+            self.assertEqual(report["topDirectory"], top)
+            self.assertEqual(report["manifestListedFileCount"], len(manifest["files"]))
+            self.assertEqual(report["archiveMemberCount"], len(manifest["files"]) + 1)
+            if used_retained_release:
+                self.assertEqual(archive_name, "archivebridge-0.1.0-win-x64.zip")
+
+    def test_top_directory_normalization_rejects_outside_and_traversal_members(self) -> None:
+        host = "windows" if platform.system().lower() == "windows" else "linux"
+        top, archive_name, valid_entries, manifest, _used_retained_release = self._fixture_entries(host)
+        invalid_members = (
+            ("README.md", b"unprefixed"),
+            ("second-root/extra.txt", b"outside expected package root"),
+            (f"{top}/../escape.txt", b"traversal"),
+        )
+        for name, contents in invalid_members:
+            with self.subTest(member=name), tempfile.TemporaryDirectory(prefix="archivebridge-acceptance-bad-package-") as temp:
+                retained_archive = REPO / "release" / archive_name if _used_retained_release else None
+                package, binary_path, _checksum = self._materialize_fixture(
+                    Path(temp), valid_entries, top, archive_name,
+                    retained_archive=retained_archive,
+                    extra_member=(name, contents),
+                )
+                if not name.startswith(top + "/"):
+                    expected_detail = "outside top directory"
+                elif ".." in name.split("/"):
+                    expected_detail = "unsupported member"
+                else:
+                    expected_detail = "invalid or duplicate relative member"
+                with self.assertRaisesRegex(acceptance.AcceptanceFailure, expected_detail):
+                    acceptance._validate_package(
+                        None,
+                        package,
+                        str(manifest["version"]),
+                        str(manifest["source"]),
+                        binary_path,
+                    )
 
 
 if __name__ == "__main__":
