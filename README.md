@@ -1,4 +1,5 @@
 # ArchiveBridge
+[![CI](https://github.com/Pastalikek65/archivebridge/actions/workflows/ci.yml/badge.svg)](https://github.com/Pastalikek65/archivebridge/actions/workflows/ci.yml)
 
 ArchiveBridge reads selected Google Photos Takeout parts and stores original media, sidecars, supported dates, source occurrences, and album relationships in a local archive.
 
