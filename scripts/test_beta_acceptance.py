@@ -6,8 +6,10 @@ from __future__ import annotations
 import importlib.util
 import base64
 import contextlib
+import ctypes
 import io
 import json
+import os
 import re
 import subprocess
 import sys
@@ -130,6 +132,46 @@ class BetaAcceptanceSafetyTests(unittest.TestCase):
             with self.assertRaises(beta.AcceptanceFailure):
                 beta._prepare_output(fixture / "nested-output", (fixture,))
             self.assertFalse((fixture / "nested-output").exists())
+
+    def test_output_path_rejects_protected_path_alias(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = root / "protected fixture with spaces"
+            fixture.mkdir()
+            if sys.platform == "win32":
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                get_short_path = kernel32.GetShortPathNameW
+                get_short_path.argtypes = (ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint)
+                get_short_path.restype = ctypes.c_uint
+                buffer = ctypes.create_unicode_buffer(32768)
+                length = get_short_path(str(fixture), buffer, len(buffer))
+                if length == 0:
+                    self.skipTest(f"GetShortPathNameW failed: {ctypes.get_last_error()}")
+                if length >= len(buffer):
+                    buffer = ctypes.create_unicode_buffer(length + 1)
+                    length = get_short_path(str(fixture), buffer, len(buffer))
+                alias = Path(buffer.value)
+                if os.path.normcase(str(alias)) == os.path.normcase(str(fixture)):
+                    self.skipTest("the temporary volume does not expose an 8.3 alias")
+                output = alias / "nested-output"
+            else:
+                alias = root / "protected fixture alias"
+                alias.symlink_to(fixture, target_is_directory=True)
+                output = fixture / "nested-output"
+
+            with self.assertRaises(beta.AcceptanceFailure):
+                beta._prepare_output(output, (alias,))
+            self.assertFalse((fixture / "nested-output").exists())
+
+    def test_output_path_rejects_missing_protected_input(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "output-parent").mkdir()
+            output = root / "output-parent" / "archive"
+            missing = root / "missing-input"
+            with self.assertRaises(beta.AcceptanceFailure):
+                beta._prepare_output(output, (missing,))
+            self.assertFalse(output.exists())
 
     def test_release_archive_hash_must_match_before_legacy_binary_is_used(self):
         with tempfile.TemporaryDirectory() as temporary:

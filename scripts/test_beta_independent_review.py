@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import ctypes
+from ctypes import wintypes
 import importlib.util
 import io
 import json
 import hashlib
+import os
 import subprocess
 import tarfile
 import tempfile
@@ -238,6 +241,32 @@ class BetaAcceptanceIndependentTests(unittest.TestCase):
                         beta._write_source_commit_identity(
                             evidence, "0.2.0", "a" * 40, fixtures, binary, allow_development=False
                         )
+
+    def test_path_alias_cannot_bypass_protected_output_overlap(self):
+        with tempfile.TemporaryDirectory(prefix="ArchiveBridgeAliasReview-") as temporary:
+            root = Path(temporary)
+            protected = root / "fixture-input-with-long-name"
+            protected.mkdir()
+            if os.name == "nt":
+                get_short_path = ctypes.WinDLL("kernel32", use_last_error=True).GetShortPathNameW
+                get_short_path.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+                get_short_path.restype = wintypes.DWORD
+                buffer = ctypes.create_unicode_buffer(32768)
+                written = get_short_path(str(protected), buffer, len(buffer))
+                self.assertTrue(written and written < len(buffer), "the Windows test volume must provide an 8.3 alias")
+                alias = Path(buffer.value)
+                self.assertEqual(alias.resolve(), protected.resolve())
+                self.assertNotEqual(os.path.normcase(str(alias)), os.path.normcase(str(protected.resolve())))
+                output = alias / "nested-output"
+            else:
+                alias = root / "fixture-alias"
+                alias.symlink_to(protected, target_is_directory=True)
+                self.assertEqual(alias.resolve(), protected.resolve())
+                output = protected / "nested-output"
+
+            with self.assertRaises(beta.AcceptanceFailure):
+                beta._prepare_output(output, (alias,))
+            self.assertFalse(output.exists(), "rejecting an aliased output must not create it")
 
 
 if __name__ == "__main__":

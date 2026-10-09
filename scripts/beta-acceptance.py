@@ -126,6 +126,21 @@ def _overlap(left: Path, right: Path) -> bool:
         return False
 
 
+def _canonical_protected(path: Path) -> Path:
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = ROOT / candidate
+    if not (_real_file(candidate) or _real_dir(candidate)):
+        raise AcceptanceFailure("every protected input must be an existing regular file or real directory")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise AcceptanceFailure(f"protected input cannot be resolved safely: {exc}") from exc
+    if not (_real_file(resolved) or _real_dir(resolved)):
+        raise AcceptanceFailure("every protected input must resolve to a regular file or real directory")
+    return resolved
+
+
 def _prepare_output(raw: Path, protected: Sequence[Path]) -> Path:
     requested = raw.expanduser()
     if not requested.is_absolute():
@@ -147,7 +162,8 @@ def _prepare_output(raw: Path, protected: Sequence[Path]) -> Path:
     candidate = parent_resolved / requested.name
     if not requested.name or requested.name in (".", ".."):
         raise AcceptanceFailure("--out must name a new child directory")
-    for item in protected:
+    canonical_protected = tuple(_canonical_protected(item) for item in protected)
+    for item in canonical_protected:
         if _overlap(candidate, item):
             raise AcceptanceFailure("--out must be disjoint from every fixture, executable, and package input")
     return candidate
