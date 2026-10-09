@@ -837,7 +837,6 @@ class Acceptance:
         assert self.binary_path is not None
         assert self.fixtures_path is not None
         assert self.args.expected_version in SUPPORTED_VERSIONS
-        self.report["startedAtUtc"] = _now()
         self.report["outputs"].update({
             "plan": str(self.out / "inspection-plan.json"),
             "archive": str(self.out / "portable-archive"),

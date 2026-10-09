@@ -95,6 +95,69 @@ class GracefulShutdownTests(unittest.TestCase):
 
 
 class InitializationSafetyTests(unittest.TestCase):
+    def test_report_interval_starts_before_git_preamble_and_survives_run_start(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="archivebridge-acceptance-time-") as temp:
+            parent = Path(temp)
+            root = parent / "project"
+            root.mkdir()
+            fixtures = root / "examples" / "sample"
+            fixtures.mkdir(parents=True)
+            for name in ("expected.json", "takeout-part-1.zip", "takeout-part-2.zip"):
+                shutil.copyfile(REPO / "examples" / "sample" / name, fixtures / name)
+            binary = root / "bin" / "archivebridge.exe"
+            binary.parent.mkdir()
+            binary.write_bytes(b"not executed by this initialization interval test")
+
+            subprocess.run(["git", "init", str(root)], check=True, capture_output=True, timeout=15)
+            subprocess.run(["git", "-C", str(root), "config", "user.name", "Acceptance interval test"],
+                           check=True, capture_output=True, timeout=15)
+            subprocess.run(["git", "-C", str(root), "config", "user.email", "interval@example.invalid"],
+                           check=True, capture_output=True, timeout=15)
+            subprocess.run(["git", "-C", str(root), "add", "-A"], check=True, capture_output=True, timeout=15)
+            subprocess.run(["git", "-C", str(root), "commit", "-m", "synthetic interval fixture"],
+                           check=True, capture_output=True, timeout=15)
+            commit = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"],
+                                             text=True, timeout=15).strip()
+
+            args = type(
+                "Args",
+                (),
+                {
+                    "binary": str(binary),
+                    "expected_version": "0.2.0",
+                    "expected_commit": commit,
+                    "allow_development": False,
+                    "fixtures_dir": str(fixtures),
+                    "out": str(parent / "acceptance-output"),
+                    "package": None,
+                    "package_root": None,
+                },
+            )()
+            times = (
+                "2026-01-01T00:00:00Z",  # acceptance object created
+                "2026-01-01T00:00:01Z",  # source-git-head start
+                "2026-01-01T00:00:02Z",  # source-git-head finish
+                "2026-01-01T00:00:03Z",  # source-git-status start
+                "2026-01-01T00:00:04Z",  # source-git-status finish
+                "2026-01-01T00:00:10Z",  # the old, incorrect run() reset
+            )
+            clock = iter(times)
+
+            class StopAfterRunStarts(Exception):
+                pass
+
+            with patch.object(acceptance, "ROOT", root), patch.object(acceptance, "_now", side_effect=lambda: next(clock)):
+                runner = acceptance.Acceptance(args)
+                runner.initialize()
+                commands = runner.report["commands"]
+                self.assertEqual([item["name"] for item in commands], ["source-git-head", "source-git-status"])
+                self.assertLessEqual(runner.report["startedAtUtc"], commands[0]["startedAtUtc"])
+                self.assertLessEqual(commands[0]["finishedAtUtc"], commands[1]["startedAtUtc"])
+                with patch.object(runner, "_json_command", side_effect=StopAfterRunStarts):
+                    with self.assertRaises(StopAfterRunStarts):
+                        runner.run()
+                self.assertEqual(runner.report["startedAtUtc"], times[0])
+
     def test_malformed_package_arguments_leave_no_requested_output(self) -> None:
         with tempfile.TemporaryDirectory(prefix="archivebridge-acceptance-args-") as temp:
             root = Path(temp)
