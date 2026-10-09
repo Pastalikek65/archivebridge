@@ -100,10 +100,10 @@ def check_version(version):
             and version['prerelease'] is None, 'SERVER_VERSION_MISMATCH')
 
 
-def docker_command(args, env=None):
+def docker_command(args, env=None, timeout=180):
     try:
         result = subprocess.run([os.environ.get('ARCHIVEBRIDGE_DOCKER', 'docker'), *args],
-                                env=env, capture_output=True, timeout=180, check=False)
+                                env=env, capture_output=True, timeout=timeout, check=False)
     except (OSError, subprocess.TimeoutExpired):
         raise Failure('DOCKER_EXECUTION_FAILED') from None
     require(result.returncode == 0, 'DOCKER_COMMAND_FAILED')
@@ -153,6 +153,7 @@ class OwnedServer:
         self.boundary = {}
         self.engine = {}
         self.startup_diagnostics = []
+        self.backend_diagnostics = []
 
     def check_engine(self):
         # The ambient context can otherwise target an unrelated remote engine.
@@ -210,14 +211,17 @@ class OwnedServer:
                           '--env', 'POSTGRES_PASSWORD', '--env', 'POSTGRES_USER=postgres',
                           '--env', 'POSTGRES_DB=immich', '--env', 'POSTGRES_INITDB_ARGS=--data-checksums', IMAGES['database']], env=env)
         redis = self.create('container', ['--name', self.prefix + '-redis', '--network-alias', 'redis', *common, IMAGES['redis']])
+        for identity in (db, redis):
+            self.docker(['container', 'start', identity])
+        self.wait_for_backends(db, redis)
+
         server = self.create('container', ['--name', self.prefix + '-server', '--network', frontend, '--memory', '2g', '--cpus', '2',
                               '--publish', '127.0.0.1::2283', '--mount', 'type=volume,source=' + media_volume + ',target=/data',
                               '--env', 'DB_PASSWORD', '--env', 'DB_USERNAME=postgres', '--env', 'DB_DATABASE_NAME=immich',
                               '--env', 'DB_HOSTNAME=database', '--env', 'REDIS_HOSTNAME=redis', '--env', 'TZ=Etc/UTC',
                               '--env', 'CPU_CORES=2', '--env', 'IMMICH_LOG_LEVEL=error', IMAGES['server']], env=env)
         self.docker(['network', 'connect', network, server])
-        for identity in (db, redis, server):
-            self.docker(['container', 'start', identity])
+        self.docker(['container', 'start', server])
         info = json.loads(self.docker(['container', 'inspect', server]))[0]
         ports = info['NetworkSettings']['Ports']['2283/tcp']
         self.boundary = {'publishedPorts': info['NetworkSettings']['Ports'],
@@ -242,6 +246,41 @@ class OwnedServer:
                 time.sleep(1)
         self.capture_startup_diagnostics()
         raise Failure('SERVER_START_TIMEOUT')
+
+    def wait_for_backends(self, database, cache):
+        deadline = time.monotonic() + 60
+        probes = (
+            ('postgres', database, ['pg_isready', '-h', '127.0.0.1', '-U', 'postgres', '-d', 'immich', '-t', '1'], None),
+            ('valkey', cache, ['valkey-cli', '-h', '127.0.0.1', 'ping'], 'PONG'),
+        )
+        last_states = {name: 'not_ready' for name, *_ in probes}
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.backend_diagnostics = [{'service': name, 'state': last_states[name]} for name, *_ in probes]
+                self.capture_startup_diagnostics()
+                raise Failure('BACKEND_START_TIMEOUT')
+
+            all_ready = True
+            for name, identity, command, expected in probes:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    all_ready = False
+                    break
+                try:
+                    output = self.docker(['container', 'exec', identity, *command], timeout=min(10, remaining))
+                    ready = expected is None or output.strip() == expected
+                except Failure:
+                    ready = False
+                last_states[name] = 'ready' if ready else 'not_ready'
+                all_ready = all_ready and ready
+            if all_ready:
+                self.backend_diagnostics = [{'service': name, 'state': 'ready'} for name, *_ in probes]
+                return
+
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(1, remaining))
 
     def capture_startup_diagnostics(self):
         # Never retain container configuration, environment, raw logs, or
@@ -879,6 +918,8 @@ def main():
         report['boundary'] = server.boundary
         if server.startup_diagnostics:
             report['startupDiagnostics'] = server.startup_diagnostics
+        if server.backend_diagnostics:
+            report['backendDiagnostics'] = server.backend_diagnostics
         if error:
             report['status'] = 'failed'
             report['error'] = error

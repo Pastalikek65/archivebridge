@@ -43,9 +43,11 @@ class LostCreateResponseTests(unittest.TestCase):
                 lost_name = run.prefix + suffix
                 inventory = {}
                 calls = []
+                call_options = []
 
-                def docker(args, env=None):
+                def docker(args, env=None, **kwargs):
                     calls.append(args)
+                    call_options.append(kwargs)
                     if args == ["context", "show"]:
                         return "default"
                     if args == ["context", "inspect", "default"]:
@@ -76,11 +78,31 @@ class LostCreateResponseTests(unittest.TestCase):
                             # Model daemon-side creation followed by a lost CLI response.
                             raise MODULE.Failure("DOCKER_EXECUTION_FAILED")
                         return identity
+                    if kind == "container" and operation == "start":
+                        self.assertIn(("container", args[-1]), inventory)
+                        return ""
+                    if kind == "network" and operation == "connect":
+                        self.assertIn(("network", args[2]), inventory)
+                        self.assertIn(("container", args[3]), inventory)
+                        return ""
                     if operation == "inspect":
                         record = inventory[(kind, args[-1])]
                         if kind == "container":
                             return json.dumps([{"Config": {"Labels": {MODULE.OWNER_LABEL: record["owner"]}}}])
                         return json.dumps([{"Labels": {MODULE.OWNER_LABEL: record["owner"]}}])
+                    if args[:2] == ["container", "exec"]:
+                        command = args[3:]
+                        if command == ["pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "immich", "-t", "1"]:
+                            self.assertEqual(args[2], "synthetic-id-" + run.prefix + "-db")
+                            self.assertGreater(kwargs.get("timeout", 0), 0)
+                            self.assertLessEqual(kwargs["timeout"], 10)
+                            return "127.0.0.1:5432 - accepting connections"
+                        if command == ["valkey-cli", "-h", "127.0.0.1", "ping"]:
+                            self.assertEqual(args[2], "synthetic-id-" + run.prefix + "-redis")
+                            self.assertGreater(kwargs.get("timeout", 0), 0)
+                            self.assertLessEqual(kwargs["timeout"], 10)
+                            return "PONG"
+                        self.fail(f"unexpected backend readiness probe: {args!r}")
                     if operation == "rm":
                         return ""
                     self.fail(f"unexpected synthetic Docker command: {args!r}")
@@ -93,6 +115,16 @@ class LostCreateResponseTests(unittest.TestCase):
                 self.assertIn(("container", lost_name), inventory)
                 removed = [args[-1] for args in calls if args[:2] == ["container", "rm"]]
                 self.assertIn(lost_name, removed)
+                if suffix == "-server":
+                    probe_indices = [i for i, args in enumerate(calls) if args[:2] == ["container", "exec"]]
+                    server_create_index = next(
+                        i for i, args in enumerate(calls)
+                        if args[:2] == ["container", "create"]
+                        and args[args.index("--name") + 1] == lost_name
+                    )
+                    self.assertEqual(len(probe_indices), 2)
+                    self.assertLess(max(probe_indices), server_create_index)
+                    self.assertTrue(all(0 < call_options[i].get("timeout", 0) <= 10 for i in probe_indices))
 
 
 class CLIReportArchiveOverlapTests(unittest.TestCase):

@@ -1,5 +1,6 @@
 """Fault checks for the real-server integration harness (no Docker required)."""
 import importlib.util
+import json
 import pathlib
 import unittest
 
@@ -8,7 +9,133 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
+def fake_docker_for_start(server, events, probe):
+    identities = {'frontend': 'network-frontend'}
+
+    def docker(args, **kwargs):
+        if args[1] == 'create' and args[0] == 'network':
+            name = args[-1]
+            identity = 'network-frontend' if name.endswith('-frontend') else 'network-internal'
+            events.append(('create-network', name))
+            return identity
+        if args[1] == 'create' and args[0] == 'volume':
+            name = args[args.index('--name') + 1]
+            events.append(('create-volume', name))
+            return 'volume-' + name.rsplit('-', 1)[-1]
+        if args[1] == 'create' and args[0] == 'container':
+            name = args[args.index('--name') + 1]
+            role = name.rsplit('-', 1)[-1]
+            identity = 'container-' + role
+            identities[role] = identity
+            events.append(('create-container', role))
+            return identity
+        if args[:2] == ['container', 'start']:
+            role = args[-1].rsplit('-', 1)[-1]
+            events.append(('start', role))
+            return ''
+        if args[:2] == ['container', 'exec']:
+            command = args[3:]
+            role = 'postgres' if command and command[0] == 'pg_isready' else 'valkey'
+            return probe(role, command, kwargs)
+        if args[:2] == ['network', 'connect']:
+            events.append(('connect', args[-1]))
+            return ''
+        if args[:2] == ['container', 'inspect']:
+            identity = args[-1]
+            if identity == identities.get('server'):
+                return json.dumps([{
+                    'NetworkSettings': {'Ports': {'2283/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '49283'}]}},
+                    'HostConfig': {'PortBindings': {'2283/tcp': [{'HostIp': '127.0.0.1', 'HostPort': ''}]},
+                                   'NetworkMode': identities['frontend'], 'Privileged': False},
+                    'Mounts': [{'Type': 'volume'}],
+                }])
+            return json.dumps([{
+                'Config': {'Labels': {MODULE.OWNER_LABEL: server.owner}},
+                'State': {'Status': 'running', 'ExitCode': 0, 'OOMKilled': False},
+            }])
+        if args[:3] == ['container', 'logs', '--tail']:
+            return ''
+        raise AssertionError(f'unexpected synthetic Docker command: {args!r}')
+
+    return docker
+
+
 class OwnershipTests(unittest.TestCase):
+    def test_backends_retry_tcp_probes_before_server_starts(self):
+        import unittest.mock
+        events = []
+        attempts = {'postgres': 0, 'valkey': 0}
+        run = MODULE.OwnedServer()
+        run.check_engine = lambda: None
+        run.check_images = lambda: None
+
+        def probe(role, command, kwargs):
+            attempts[role] += 1
+            events.append(('probe', role, attempts[role]))
+            self.assertGreater(kwargs['timeout'], 0)
+            self.assertLessEqual(kwargs['timeout'], 10)
+            if role == 'postgres':
+                self.assertEqual(command, ['pg_isready', '-h', '127.0.0.1', '-U', 'postgres',
+                                            '-d', 'immich', '-t', '1'])
+                if attempts[role] == 1:
+                    raise MODULE.Failure('DOCKER_COMMAND_FAILED')
+                return '127.0.0.1:5432 - accepting connections'
+            self.assertEqual(command, ['valkey-cli', '-h', '127.0.0.1', 'ping'])
+            return 'LOADING' if attempts[role] == 1 else 'PONG'
+
+        run.docker = fake_docker_for_start(run, events, probe)
+        with unittest.mock.patch.object(MODULE.time, 'sleep', return_value=None), \
+             unittest.mock.patch.object(MODULE, 'http_json', return_value={
+                 'major': 3, 'minor': 3, 'patch': 1, 'prerelease': None,
+             }):
+            run.start()
+
+        server_start = events.index(('start', 'server'))
+        self.assertLess(events.index(('start', 'db')), events.index(('probe', 'postgres', 1)))
+        self.assertLess(events.index(('start', 'redis')), events.index(('probe', 'valkey', 1)))
+        self.assertLess(events.index(('probe', 'postgres', 2)), server_start)
+        self.assertLess(events.index(('probe', 'valkey', 2)), server_start)
+        self.assertEqual(run.backend_diagnostics, [
+            {'service': 'postgres', 'state': 'ready'}, {'service': 'valkey', 'state': 'ready'},
+        ])
+
+    def test_backend_deadline_captures_owned_diagnostics_without_starting_server(self):
+        import unittest.mock
+        events = []
+        run = MODULE.OwnedServer()
+        run.check_engine = lambda: None
+        run.check_images = lambda: None
+        clock = {'now': 0}
+
+        def probe(role, command, kwargs):
+            events.append(('probe', role, command))
+            self.assertGreater(kwargs['timeout'], 0)
+            self.assertLessEqual(kwargs['timeout'], 10)
+            raise MODULE.Failure('DOCKER_COMMAND_FAILED')
+
+        def sleep(seconds):
+            clock['now'] += seconds
+
+        run.docker = fake_docker_for_start(run, events, probe)
+        with unittest.mock.patch.object(MODULE.time, 'monotonic', side_effect=lambda: clock['now']), \
+             unittest.mock.patch.object(MODULE.time, 'sleep', side_effect=sleep):
+            with self.assertRaises(MODULE.Failure) as error:
+                run.start()
+
+        self.assertEqual(str(error.exception), 'BACKEND_START_TIMEOUT')
+        self.assertEqual(clock['now'], 60)
+        self.assertEqual([event[1] for event in events if event[0] == 'start'], ['db', 'redis'])
+        self.assertNotIn(('create-container', 'server'), events)
+        self.assertTrue(any(event[0] == 'probe' and event[1] == 'postgres'
+                            and event[2][event[2].index('-h') + 1] == '127.0.0.1' for event in events))
+        self.assertTrue(any(event[0] == 'probe' and event[1] == 'valkey'
+                            and event[2][event[2].index('-h') + 1] == '127.0.0.1' for event in events))
+        self.assertEqual(run.backend_diagnostics, [
+            {'service': 'postgres', 'state': 'not_ready'}, {'service': 'valkey', 'state': 'not_ready'},
+        ])
+        self.assertEqual(len(run.startup_diagnostics), 2)
+        self.assertTrue(all(item['state'] == 'running' for item in run.startup_diagnostics))
+
     def test_startup_diagnostics_keep_credentials_and_foreign_logs_out(self):
         import json
         run = MODULE.OwnedServer()
